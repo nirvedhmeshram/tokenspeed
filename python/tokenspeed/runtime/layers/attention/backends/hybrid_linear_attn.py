@@ -88,20 +88,80 @@ def compute_state_page_indices(
     evolution); crossing a boundary reads the old page and writes the new
     one; resuming from a prefix hit reads the claimed snapshot page and
     writes the fresh working page.
+
+    Thin single-table wrapper over ``compute_state_page_indices_batched``
+    (k == 1). Returns ([bs], [bs]) int32 (state_in, state_out).
     """
+    state_in, state_out = compute_state_page_indices_batched(
+        rows.unsqueeze(0),
+        page_size,
+        seq_lens_before,
+        seq_lens_after,
+        validate=validate,
+    )
+    return state_in.squeeze(0), state_out.squeeze(0)
+
+
+def compute_state_page_indices_batched(
+    rows: torch.Tensor,
+    page_size: int,
+    seq_lens_before: torch.Tensor,
+    seq_lens_after: torch.Tensor,
+    *,
+    validate: bool = True,
+    out_in: torch.Tensor | None = None,
+    out_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched dual-index over k stacked shard tables (the semantics of
+    ``compute_state_page_indices`` applied per table). Every shard pages
+    the same request positions, so the slot math (div/clamp over
+    before/after) is shared and computed once, and both gathers run
+    batched over dim 2.
+
+    Args:
+        rows: [k, bs, max_pages] page ids (-1 pad, 0 hole); row i is the
+            "linear_attention_shard{i}" block table. int32 (required when
+            ``out_in``/``out_out`` are passed).
+        page_size: State page size P (tokens).
+        seq_lens_before / seq_lens_after: [bs] token counts before/after
+            this forward, shared across shards.
+        validate: Host-syncing guard checks (pad/hole in-page reads, table
+            overrun, out-page uniqueness -- enforced per shard).
+        out_in / out_out: Optional persistent [k, >= bs] int32 buffers
+            (pass both or neither). Page ids are gathered directly into
+            their ``[:, :bs]`` slices -- the CUDA-graph replay path's
+            zero-intermediate write -- and those slices are returned.
+
+    Returns:
+        (state_in, state_out): [k, bs] int32 page ids (the buffer slices
+        when ``out_in``/``out_out`` were passed).
+    """
+    if (out_in is None) != (out_out is None):
+        raise ValueError("out_in and out_out must be passed together")
     bs = seq_lens_before.shape[0]
-    rows = rows[:bs]
+    k = rows.shape[0]
+    rows = rows[:, :bs]
     before = seq_lens_before.to(torch.int64)
     after = seq_lens_after.to(torch.int64)
-    max_slots = rows.shape[1]
+    max_slots = rows.shape[2]
 
     in_slots = torch.div(before - 1, page_size, rounding_mode="floor").clamp_(min=0)
     out_slots = torch.div(after - 1, page_size, rounding_mode="floor")
     out_slots_safe = out_slots.clamp(min=0, max=max_slots - 1)
+    in_index = in_slots.view(1, bs, 1).expand(k, bs, 1)
+    out_index = out_slots_safe.view(1, bs, 1).expand(k, bs, 1)
 
-    state_in = rows.gather(1, in_slots.unsqueeze(1)).squeeze(1)
-    state_in = torch.where(before > 0, state_in, torch.zeros_like(state_in))
-    state_out = rows.gather(1, out_slots_safe.unsqueeze(1)).squeeze(1)
+    if out_in is not None:
+        state_in = out_in[:, :bs]
+        state_out = out_out[:, :bs]
+        torch.gather(rows, 2, in_index, out=state_in.unsqueeze(2))
+        torch.gather(rows, 2, out_index, out=state_out.unsqueeze(2))
+        # before == 0 -> no history -> in page 0 (the null page).
+        state_in.masked_fill_((before <= 0).view(1, bs), 0)
+    else:
+        state_in = rows.gather(2, in_index).squeeze(2)
+        state_in = torch.where(before > 0, state_in, torch.zeros_like(state_in))
+        state_out = rows.gather(2, out_index).squeeze(2)
 
     if validate:
         if bool((after <= 0).any()):
@@ -113,7 +173,7 @@ def compute_state_page_indices(
                 "state paging: out page slot exceeds flat table width "
                 f"{max_slots} (page_size={page_size})"
             )
-        if bool((state_in[before > 0] <= 0).any()):
+        if bool((state_in[:, before > 0] <= 0).any()):
             raise ValueError(
                 "state paging: in page is a pad (-1) or hole (0) for a "
                 "request with history; reading it would silently resume "
@@ -126,8 +186,13 @@ def compute_state_page_indices(
                 f"{_STATE_GROUP_ID!r} table"
             )
         # The <= 0 raise above guarantees every state_out entry is positive.
-        if torch.unique(state_out).numel() != state_out.numel():
-            raise ValueError("state out pages must be unique per batch")
+        # Uniqueness holds per shard: each shard table hands out its own
+        # page-id space, so cross-shard collisions are meaningless.
+        for shard_out in state_out:
+            if torch.unique(shard_out).numel() != shard_out.numel():
+                raise ValueError("state out pages must be unique per batch")
+    if out_in is not None:
+        return state_in, state_out
     return state_in.to(torch.int32), state_out.to(torch.int32)
 
 
@@ -155,6 +220,12 @@ class MambaForwardMetadata:
     # history and must be zero-seeded rather than read from the aliased
     # (dirty) null page row 0 (R1, see state_shard_view WARNING).
     state_seq_lens_before: torch.Tensor | None = None
+    # Extend-only precomputes (hoisted out of the per-state-layer forward):
+    # int64 copies of the page tables for advanced indexing, and the R1
+    # fresh mask (before == 0). None on decode/replay metadata.
+    state_in_pages_i64: torch.Tensor | None = None
+    state_out_pages_i64: torch.Tensor | None = None
+    state_fresh_mask: torch.Tensor | None = None
 
 
 class LayerMappedKVPool:
@@ -514,9 +585,14 @@ class MambaAttnBackend(AttentionBackend):
         self.kv_pool = None
         self.flat_state_active = False
         self._num_state_shards = 0
+        self._shard_group_ids: tuple[str, ...] = ()
         self._flat_state_page_size = 1
         self.flat_state_in_list: list[torch.Tensor] = []
         self.flat_state_out_list: list[torch.Tensor] = []
+        # Layers whose head groups already passed the one-time GQA ratio
+        # alignment check (lazy: the q/v head counts only arrive with the
+        # first forward's kwargs).
+        self._gqa_checked_layers: set[int] = set()
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
@@ -538,6 +614,11 @@ class MambaAttnBackend(AttentionBackend):
             bool(view is not None and view.is_active) and num_shards > 0
         )
         self._num_state_shards = num_shards if self.flat_state_active else 0
+        # Prebuilt once per pool binding so the per-step metadata paths
+        # never re-run the k f-strings.
+        self._shard_group_ids = tuple(
+            f"{_STATE_SHARD_PREFIX}{i}" for i in range(self._num_state_shards)
+        )
         self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
 
     def _flat_state_pages(
@@ -548,6 +629,8 @@ class MambaAttnBackend(AttentionBackend):
         kwargs: dict,
         *,
         validate: bool | None = None,
+        out_in: torch.Tensor | None = None,
+        out_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """(state_in, state_out, before) for this forward: [k, bs] page ids
         (row i from the "linear_attention_shard{i}" block table; every shard
@@ -558,11 +641,14 @@ class MambaAttnBackend(AttentionBackend):
 
         validate: explicit True/False wins; None (the hot-path default)
         validates only under TOKENSPEED_FLAT_DEBUG=1 (the checks host-sync).
+        out_in/out_out: optional persistent [k, >= bs] buffers gathered
+        into directly (the CUDA-graph replay path), see
+        ``compute_state_page_indices_batched``.
         """
         if validate is None:
             validate = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
         flat_tables = kwargs.get("flat_block_tables")
-        shard_ids = [f"{_STATE_SHARD_PREFIX}{i}" for i in range(self._num_state_shards)]
+        shard_ids = self._shard_group_ids
         missing = [
             gid for gid in shard_ids if not flat_tables or gid not in flat_tables
         ]
@@ -585,23 +671,23 @@ class MambaAttnBackend(AttentionBackend):
                 )
             else:
                 before = torch.zeros_like(after)
-        state_in_list = []
-        state_out_list = []
-        for gid in shard_ids:
-            state_in, state_out = compute_state_page_indices(
-                flat_tables[gid],
-                self._flat_state_page_size,
-                before,
-                after,
-                validate=validate,
-            )
-            state_in_list.append(state_in)
-            state_out_list.append(state_out)
-        return (
-            torch.stack(state_in_list, dim=0),
-            torch.stack(state_out_list, dim=0),
+        # One [k, bs, W] stack (a view when k == 1), then a single batched
+        # dual-index over all shards -- the per-request slot math runs once
+        # instead of k times.
+        if len(shard_ids) == 1:
+            rows = flat_tables[shard_ids[0]][:bs].unsqueeze(0)
+        else:
+            rows = torch.stack([flat_tables[gid][:bs] for gid in shard_ids], dim=0)
+        state_in, state_out = compute_state_page_indices_batched(
+            rows,
+            self._flat_state_page_size,
             before,
+            after,
+            validate=validate,
+            out_in=out_in,
+            out_out=out_out,
         )
+        return state_in, state_out, before
 
     def reset_current_inputs(
         self, req_pool_indices: torch.Tensor, working_indices: torch.Tensor
@@ -705,6 +791,9 @@ class MambaAttnBackend(AttentionBackend):
         state_in_pages = None
         state_out_pages = None
         state_seq_lens_before = None
+        state_in_pages_i64 = None
+        state_out_pages_i64 = None
+        state_fresh_mask = None
         # Idle/bs==0 forwards carry no requests and never reach the mamba
         # forward (router returns early), so no tables are required.
         if self.flat_state_active and bs > 0 and not forward_mode.is_idle():
@@ -717,6 +806,13 @@ class MambaAttnBackend(AttentionBackend):
             state_in_pages, state_out_pages, state_seq_lens_before = (
                 self._flat_state_pages(bs, seq_lens, forward_mode, kwargs)
             )
+            if not forward_mode.is_decode_or_idle():
+                # Extend consumes int64 advanced indices and the R1 fresh
+                # mask once per state layer; precompute them here instead
+                # of in every layer's forward.
+                state_in_pages_i64 = state_in_pages.to(torch.int64)
+                state_out_pages_i64 = state_out_pages.to(torch.int64)
+                state_fresh_mask = state_seq_lens_before == 0
 
         track_ssm_h_src = None
         track_ssm_h_src_fla = None
@@ -800,6 +896,9 @@ class MambaAttnBackend(AttentionBackend):
             state_in_pages=state_in_pages,
             state_out_pages=state_out_pages,
             state_seq_lens_before=state_seq_lens_before,
+            state_in_pages_i64=state_in_pages_i64,
+            state_out_pages_i64=state_out_pages_i64,
+            state_fresh_mask=state_fresh_mask,
         )
 
     def _compute_track_conv_indices(
@@ -985,11 +1084,7 @@ class MambaAttnBackend(AttentionBackend):
                     "plain decode only (flat+spec unsupported)"
                 )
             flat_ids = kwargs.get("flat_cache_group_ids", ())
-            missing = [
-                f"{_STATE_SHARD_PREFIX}{i}"
-                for i in range(self._num_state_shards)
-                if f"{_STATE_SHARD_PREFIX}{i}" not in flat_ids
-            ]
+            missing = [gid for gid in self._shard_group_ids if gid not in flat_ids]
             if missing:
                 raise RuntimeError(
                     "flat GDN state paging: capture is missing the "
@@ -1116,17 +1211,19 @@ class MambaAttnBackend(AttentionBackend):
             # Decode-only (q_len == 1): before = seq_lens - 1. Padded rows
             # (zero table rows, seq_lens 1) are overwritten with pad_slot_id
             # below, so validation is skipped to avoid a host sync.
-            state_in, state_out, _ = self._flat_state_pages(
+            state_in_pages = self.flat_state_in_list[bs - 1]
+            state_out_pages = self.flat_state_out_list[bs - 1]
+            # Gather straight into the persistent [k, bs] tables: no
+            # intermediate stack + copy on this per-step path.
+            self._flat_state_pages(
                 bs,
                 seq_lens,
                 forward_mode,
                 kwargs,
                 validate=False,
+                out_in=state_in_pages,
+                out_out=state_out_pages,
             )
-            state_in_pages = self.flat_state_in_list[bs - 1]
-            state_out_pages = self.flat_state_out_list[bs - 1]
-            state_in_pages[:, :real_bs].copy_(state_in[:, :real_bs])
-            state_out_pages[:, :real_bs].copy_(state_out[:, :real_bs])
             if num_padding > 0:
                 state_in_pages[:, real_bs:].fill_(self.pad_slot_id)
                 state_out_pages[:, real_bs:].fill_(self.pad_slot_id)
@@ -1257,15 +1354,26 @@ class MambaAttnBackend(AttentionBackend):
             # the group's own shard table.
             num_v_heads = value.shape[2]
             ratio = num_v_heads // num_heads
+            if layer_id not in self._gqa_checked_layers:
+                # One-time lazy gate per layer: the q/v head counts only
+                # arrive with the first forward's kwargs (set_kv_pool sees
+                # neither the per-layer head dims nor the bound head
+                # groups), so the ratio alignment can't be hoisted there.
+                # The head-group layout itself (ascending, contiguous,
+                # head_begin 0 first) is asserted once in
+                # StateShardView.bind.
+                for g in head_groups:
+                    hb, he = g.head_begin, g.head_begin + g.num_heads
+                    if hb % ratio or g.num_heads % ratio:
+                        raise RuntimeError(
+                            "flat GDN state paging: ssm head group "
+                            f"[{hb}, {he}) is not aligned to the GQA ratio "
+                            f"{ratio} (HV={num_v_heads}, H={num_heads})"
+                        )
+                self._gqa_checked_layers.add(layer_id)
             outs = []
             for g in head_groups:
                 hb, he = g.head_begin, g.head_begin + g.num_heads
-                if hb % ratio or g.num_heads % ratio:
-                    raise RuntimeError(
-                        "flat GDN state paging: ssm head group "
-                        f"[{hb}, {he}) is not aligned to the GQA ratio "
-                        f"{ratio} (HV={num_v_heads}, H={num_heads})"
-                    )
                 outs.append(
                     fused_sigmoid_gating_delta_rule_update(
                         A_log=A_log[hb:he],
@@ -1380,20 +1488,21 @@ class MambaAttnBackend(AttentionBackend):
             use_flat = state_in_pages is not None
             if use_flat:
                 # state_in/out_pages are [k, bs]: row g.shard pages a group's
-                # ssm rows, row g.conv_shard the layer's conv rows.
+                # ssm rows, row g.conv_shard the layer's conv rows. The int64
+                # index copies and the R1 fresh mask are precomputed once in
+                # init_forward_metadata (shared by every state layer).
                 head_groups = self.kv_pool.get_state_buffers(layer_id)
-                state_in_long = state_in_pages.to(torch.int64)
-                state_out_long = state_out_pages.to(torch.int64)
-                before = self.forward_metadata.state_seq_lens_before
-                if before is None:
+                state_in_long = self.forward_metadata.state_in_pages_i64
+                state_out_long = self.forward_metadata.state_out_pages_i64
+                # R1: requests with no history read row 0, which aliases the
+                # KV dummy page and is NOT zero (padded tokens write it, see
+                # state_shard_view WARNING) — zero-seed instead of copying.
+                fresh = self.forward_metadata.state_fresh_mask
+                if state_in_long is None or fresh is None:
                     raise RuntimeError(
                         "flat GDN state paging: extend forward requires "
                         "state_seq_lens_before metadata for R1 zero-seeding"
                     )
-                # R1: requests with no history read row 0, which aliases the
-                # KV dummy page and is NOT zero (padded tokens write it, see
-                # state_shard_view WARNING) — zero-seed instead of copying.
-                fresh = before == 0
                 conv_group = head_groups[0]
                 conv_states = conv_group.conv
                 # Seed the out page's conv window from the in page (identity

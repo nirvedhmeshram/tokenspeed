@@ -325,6 +325,30 @@ class StateShardView:
             ]
             for layer_id, pair in self._layer_state_pair.items()
         }
+        # One-time layout invariants consumed by the backend's per-step
+        # decode loop (hoisted out of the hot path): each state layer's
+        # head groups must tile [0, heads) contiguously in ascending
+        # head_begin order, so groups[0] carries head_begin == 0 and owns
+        # the whole-layer conv update.
+        num_heads_total = self._temporal_state_shape[0]
+        for layer_id, groups in self._state_buffers.items():
+            expected_begin = 0
+            for group in groups:
+                if group.head_begin != expected_begin:
+                    raise ValueError(
+                        f"state layer {layer_id}: ssm head groups must tile "
+                        f"[0, {num_heads_total}) contiguously in ascending "
+                        f"head_begin order, got head_begin "
+                        f"{group.head_begin} where {expected_begin} was "
+                        "expected"
+                    )
+                expected_begin += group.num_heads
+            if expected_begin != num_heads_total:
+                raise ValueError(
+                    f"state layer {layer_id}: ssm head groups cover "
+                    f"[0, {expected_begin}) but the layer has "
+                    f"{num_heads_total} ssm heads"
+                )
         logger.info(
             "State shard views: %d state layers x %d head groups over %d "
             "K/V slab page rows (row 0 = null page), k=%d shards",

@@ -318,6 +318,48 @@ class StateShardViewTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"duplicate slab tensor"):
             view.bind(k, v)
 
+    # 8. Head-group layout invariants (backend decode-loop contract) ---------
+
+    def _mutated_bin_table(self, mutate_ssm_entries):
+        import dataclasses
+
+        table = self._bin_table()
+        return dataclasses.replace(
+            table, ssm_entries=tuple(mutate_ssm_entries(table.ssm_entries))
+        )
+
+    def test_bind_rejects_gapped_head_groups(self):
+        # Shift layer 0's first ssm group off head 0: the groups no longer
+        # tile [0, heads) from head_begin 0, the invariant the backend's
+        # decode loop (conv update off groups[0]) relies on.
+        import dataclasses
+
+        def mutate(entries):
+            return [
+                (
+                    dataclasses.replace(e, head_begin=1)
+                    if e.state_layer == 0 and e.head_begin == 0
+                    else e
+                )
+                for e in entries
+            ]
+
+        view = self._view(bin_table=self._mutated_bin_table(mutate))
+        with self.assertRaisesRegex(ValueError, r"contiguously"):
+            view.bind(*self._slabs())
+
+    def test_bind_rejects_missing_head_group(self):
+        # Drop layer 0's tail group: coverage falls short of the layer's
+        # ssm head count.
+        def mutate(entries):
+            return [
+                e for e in entries if not (e.state_layer == 0 and e.head_begin == 2)
+            ]
+
+        view = self._view(bin_table=self._mutated_bin_table(mutate))
+        with self.assertRaisesRegex(ValueError, r"cover"):
+            view.bind(*self._slabs())
+
 
 if __name__ == "__main__":
     unittest.main()
