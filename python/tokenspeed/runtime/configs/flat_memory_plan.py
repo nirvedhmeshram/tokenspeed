@@ -253,3 +253,113 @@ def plan_tensors(components, *, block_size, alignment, budget_bytes):
         for slot, bindings in enumerate(slot_bindings)
     )
     return FlatMemoryPlan(geometry=geo, tensors=tensors)
+
+
+@dataclass(frozen=True)
+class ShardBinEntry:
+    state_layer: int  # within-state occurrence index (slab pairing order)
+    head_begin: int  # first ssm head of this group; 0 for conv entries
+    num_heads: int  # ssm heads in this group; 0 for conv entries
+    nbytes: int
+    shard: int  # 0..k-1 (which shard-group block carries this piece)
+    slot: int  # 0..num_full_layers-1 (which full layer's slab)
+    kv_side: int  # 0 = K slab, 1 = V slab
+    byte_offset: int  # byte offset inside the page row
+
+
+@dataclass(frozen=True)
+class StateShardBinTable:
+    num_shards: int
+    block_size: int
+    segment_bytes: int
+    heads_per_group: int
+    ssm_entries: tuple[ShardBinEntry, ...]
+    conv_entries: tuple[ShardBinEntry, ...]
+
+
+def shard_bin_table(
+    *,
+    num_full_layers,
+    num_state_layers,
+    ssm_heads_per_layer,
+    ssm_head_bytes,
+    conv_bytes_per_layer,
+    kv_cell_bytes_per_tok,
+    block_size,
+):
+    """Pack GDN state (conv+ssm rows of every state layer) into segments of
+    the full layers' K/V page rows; num_shards (k) falls out of the packing.
+    Segment = one full layer's K (or V) page row = (cell // 2) * P bytes.
+    Pure function: no torch, deterministic first-fit.
+
+    Args:
+        num_full_layers: Full-attention layers per group; each contributes
+            two segments (K slab + V slab) to a shard-group block.
+        num_state_layers: GDN/mamba2 state layers whose conv+ssm rows are
+            packed into the full layers' spare K/V segments.
+        ssm_heads_per_layer: SSM heads in one state layer; split into groups
+            of ``heads_per_group`` so each group fits one segment.
+        ssm_head_bytes: Bytes of one head's state cell (fp32 128x128 = 65536).
+        conv_bytes_per_layer: Conv state row bytes of one state layer.
+        kv_cell_bytes_per_tok: K+V combined bytes per token; ``// 2`` gives the
+            single-side (K or V) segment width.
+        block_size: Page block size P (tokens); must be a multiple of 64.
+
+    Returns:
+        StateShardBinTable: num_shards (k), segment/head-group geometry, and
+        the packed ssm/conv entries.
+    """
+    if block_size % 64 != 0:
+        raise ValueError(f"block_size must be a multiple of 64, got {block_size}")
+    if num_full_layers < 1 or num_state_layers < 1:
+        raise ValueError(
+            "need at least one full layer and one state layer, got "
+            f"{num_full_layers} full / {num_state_layers} state"
+        )
+    if kv_cell_bytes_per_tok % 2 != 0:
+        raise ValueError(
+            f"kv_cell_bytes_per_tok must be even (K+V split in half), got "
+            f"{kv_cell_bytes_per_tok}"
+        )
+    segment_bytes = (kv_cell_bytes_per_tok // 2) * block_size
+    heads_per_group = segment_bytes // ssm_head_bytes
+    if heads_per_group < 1:
+        raise ValueError(
+            f"segment {segment_bytes}B cannot hold one ssm head cell "
+            f"({ssm_head_bytes}B); raise block_size"
+        )
+    if conv_bytes_per_layer > segment_bytes:
+        raise ValueError(
+            f"conv row exceeds one segment: {conv_bytes_per_layer}B > "
+            f"{segment_bytes}B; raise block_size"
+        )
+    segs_per_shard = num_full_layers * 2
+
+    def seg_pos(s):
+        return (s // segs_per_shard, (s % segs_per_shard) // 2, s % 2)
+
+    ssm, seg = [], 0
+    for layer in range(num_state_layers):
+        for begin in range(0, ssm_heads_per_layer, heads_per_group):
+            nh = min(heads_per_group, ssm_heads_per_layer - begin)
+            sh, sl, side = seg_pos(seg)
+            ssm.append(
+                ShardBinEntry(layer, begin, nh, nh * ssm_head_bytes, sh, sl, side, 0)
+            )
+            seg += 1
+    conv, off = [], 0
+    for layer in range(num_state_layers):
+        if off + conv_bytes_per_layer > segment_bytes:
+            seg, off = seg + 1, 0
+        sh, sl, side = seg_pos(seg)
+        conv.append(ShardBinEntry(layer, 0, 0, conv_bytes_per_layer, sh, sl, side, off))
+        off += conv_bytes_per_layer
+    total_segs = seg + 1
+    return StateShardBinTable(
+        num_shards=-(-total_segs // segs_per_shard),
+        block_size=block_size,
+        segment_bytes=segment_bytes,
+        heads_per_group=heads_per_group,
+        ssm_entries=tuple(ssm),
+        conv_entries=tuple(conv),
+    )

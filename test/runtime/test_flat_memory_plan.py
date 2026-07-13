@@ -39,6 +39,9 @@ solve_page_geometry = _fmp.solve_page_geometry
 plan_tensors = _fmp.plan_tensors
 plan_component_tensors = _fmp.plan_component_tensors
 components_from_layers = _fmp.components_from_layers
+shard_bin_table = _fmp.shard_bin_table
+ShardBinEntry = _fmp.ShardBinEntry
+StateShardBinTable = _fmp.StateShardBinTable
 
 
 class EqualizerTest(unittest.TestCase):
@@ -378,6 +381,96 @@ class ComponentsFromLayersTest(unittest.TestCase):
             comps, block_size=16, alignment=4, budget_bytes=100 * 1024 * 1024
         )
         self.assertEqual(plan.geometry.block_size, 100)  # inflated by the state row
+
+
+TP8_KW = dict(  # Qwen3.5-35B-A3B @ tp8 真值
+    num_full_layers=10,
+    num_state_layers=30,
+    ssm_heads_per_layer=4,
+    ssm_head_bytes=65536,  # 128*128*fp32
+    conv_bytes_per_layer=6144,  # 49152/8
+    kv_cell_bytes_per_tok=1024,  # K+V 一层一 tok
+    block_size=256,
+)
+
+
+class ShardBinTableTest(unittest.TestCase):
+    def test_bin_table_tp8_truth(self):
+        bt = shard_bin_table(**TP8_KW)
+        self.assertEqual(bt.num_shards, 4)
+        self.assertEqual(bt.segment_bytes, 512 * 256)
+        self.assertEqual(bt.heads_per_group, 2)
+        ssm_by_layer = {}
+        for e in bt.ssm_entries:
+            ssm_by_layer.setdefault(e.state_layer, []).append(e)
+        self.assertEqual(len(ssm_by_layer), 30)
+        self.assertTrue(all(len(v) == 2 for v in ssm_by_layer.values()))
+        self.assertEqual(len(bt.conv_entries), 30)
+        for e in bt.ssm_entries + bt.conv_entries:
+            self.assertTrue(0 <= e.shard < 4)
+            self.assertTrue(0 <= e.slot < 10)
+            self.assertIn(e.kv_side, (0, 1))
+            self.assertLessEqual(e.byte_offset + e.nbytes, bt.segment_bytes)
+        # Golden enumeration order: side varies fastest, then slot, then shard.
+        self.assertEqual(
+            [(e.shard, e.slot, e.kv_side) for e in bt.ssm_entries[:3]],
+            [(0, 0, 0), (0, 0, 1), (0, 1, 0)],
+        )
+        e0 = bt.conv_entries[0]
+        self.assertEqual((e0.shard, e0.slot, e0.kv_side, e0.byte_offset), (3, 0, 0, 0))
+
+    def test_bin_table_no_overlap_tp8(self):
+        bt = shard_bin_table(**TP8_KW)
+        spans = []
+        for e in bt.ssm_entries + bt.conv_entries:
+            key = (e.shard, e.slot, e.kv_side)
+            for k2, a, b in spans:
+                if k2 == key:
+                    self.assertTrue(e.byte_offset >= b or e.byte_offset + e.nbytes <= a)
+            spans.append((key, e.byte_offset, e.byte_offset + e.nbytes))
+
+    def test_bin_table_k_parametrized(self):
+        cases = [
+            (8, 1024, 30, 4, 6144, 256, 4),
+            (8, 1024, 30, 4, 6144, 128, 7),
+            (4, 1024, 30, 8, 12288, 256, 7),
+            (1, 2048, 30, 32, 49152, 256, 13),
+            (16, 1024, 30, 2, 3072, 256, 2),
+        ]
+        for tp, cell, s_layer, heads, conv, p, expect_k in cases:
+            with self.subTest(tp=tp, cell=cell, block_size=p):
+                bt = shard_bin_table(
+                    num_full_layers=10,
+                    num_state_layers=s_layer,
+                    ssm_heads_per_layer=heads,
+                    ssm_head_bytes=65536,
+                    conv_bytes_per_layer=conv,
+                    kv_cell_bytes_per_tok=cell,
+                    block_size=p,
+                )
+                self.assertEqual(bt.num_shards, expect_k)
+
+    def test_bin_table_rejects_non64_block(self):
+        with self.assertRaisesRegex(ValueError, "multiple of 64"):
+            shard_bin_table(**{**TP8_KW, "block_size": 200})
+
+    def test_bin_table_rejects_segment_below_one_cell(self):
+        with self.assertRaisesRegex(ValueError, "one ssm head cell"):
+            shard_bin_table(**{**TP8_KW, "block_size": 64})
+
+    def test_bin_table_rejects_conv_row_over_segment(self):
+        with self.assertRaisesRegex(ValueError, "conv row exceeds one segment"):
+            shard_bin_table(**{**TP8_KW, "conv_bytes_per_layer": 512 * 256 + 1})
+
+    def test_bin_table_rejects_zero_layers(self):
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            shard_bin_table(**{**TP8_KW, "num_state_layers": 0})
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            shard_bin_table(**{**TP8_KW, "num_full_layers": 0})
+
+    def test_bin_table_rejects_odd_kv_cell(self):
+        with self.assertRaisesRegex(ValueError, "even"):
+            shard_bin_table(**{**TP8_KW, "kv_cell_bytes_per_tok": 1023})
 
 
 if __name__ == "__main__":
