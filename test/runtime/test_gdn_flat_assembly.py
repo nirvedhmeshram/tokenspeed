@@ -1,12 +1,13 @@
-"""Flat assembly line for GDN hybrids (M17 C4).
+"""Flat assembly line for GDN hybrids (M17 C4, M18c state binning).
 
-Three contracts: the Qwen3.5 config exposes ``layer_types`` in the
-paged-cache label vocabulary; the page-size equalization decision
-(``equalized_block_size``) inflates P to cover the GDN state row;
-and an MHAConfig carrying state shapes builds a full-coverage pool with
-one (conv, ssm) slab pair per state layer, both cache groups published,
-and the ctor geometry check enforcing the equalized P. Flat GDN sizing
-itself is plan-driven (plan_component_tensors, test_flat_memory_plan).
+Two contracts: the Qwen3.5 config exposes ``layer_types`` in the
+paged-cache label vocabulary; and an MHAConfig carrying state shapes plus
+a state shard bin table builds a full-coverage pool whose GDN state is
+head-group reinterpret views over the full layers' K/V slabs, with the
+full group and the k ``linear_attention_shard{i}`` groups published.
+Flat GDN sizing itself is plan-driven (plan_component_tensors,
+test_flat_memory_plan); the bin packing is shard_bin_table's
+(test_flat_memory_plan too).
 """
 
 from __future__ import annotations
@@ -49,18 +50,7 @@ def _load(mod_name: str, file_name: str):
 
 
 _plan = _load("flat_memory_plan_gdn_assembly_under_test", "flat_memory_plan.py")
-equalized_block_size = _plan.equalized_block_size
-
-
-# Qwen3.5-ish interleaving: 3 linear layers then 1 full, times 12 (48 layers).
-QWEN3_5ISH_LAYER_TYPES = (["linear_attention"] * 3 + ["full_attention"]) * 12
-
-# Qwen3.5 defaults at attn TP=1 (configs/qwen3_5_text_base_config.py):
-# KV row: 2 (K+V) * 2 kv heads * 256 head_dim * 2 B (bf16) per token-layer.
-QWEN3_5ISH_KV_BYTES_PER_SLOT = 2 * 2 * 256 * 2  # 2048
-# conv: (2*128*16 + 128*32) x (4 - 1) in bf16; ssm: 32 x 128 x 128 in fp32.
-QWEN3_5ISH_CONV_BYTES = (2 * 128 * 16 + 128 * 32) * 3 * 2  # 49152
-QWEN3_5ISH_SSM_BYTES = 32 * 128 * 128 * 4  # 2097152
+shard_bin_table = _plan.shard_bin_table
 
 
 class Qwen3_5LayerTypesTest(unittest.TestCase):
@@ -98,55 +88,22 @@ class Qwen3_5LayerTypesTest(unittest.TestCase):
         self.assertEqual(cfg.layer_types, ["full_attention"] * 2)
 
 
-class EqualizedPageSizeTest(unittest.TestCase):
-    """Pure equalization decision (no torch)."""
-
-    def _equalized(self, block_size, **kwargs):
-        return equalized_block_size(
-            layer_types=QWEN3_5ISH_LAYER_TYPES,
-            kv_bytes_per_slot=QWEN3_5ISH_KV_BYTES_PER_SLOT,
-            state_const_bytes={
-                "conv": QWEN3_5ISH_CONV_BYTES,
-                "ssm": QWEN3_5ISH_SSM_BYTES,
-            },
-            block_size=block_size,
-            **kwargs,
-        )
-
-    def test_inflates_to_cover_state_row(self):
-        # ceil((49152 + 2097152) / 2048) = 1048 tokens to cover the state
-        # row; default alignment = original block size 64 -> 1088.
-        self.assertEqual(self._equalized(64), 1088)
-
-    def test_unchanged_when_kv_row_already_covers(self):
-        self.assertEqual(self._equalized(2048), 2048)
-
-    def test_explicit_alignment(self):
-        # 1048 rounded up to a multiple of 16 -> 1056.
-        self.assertEqual(self._equalized(64, alignment=16), 1056)
-
-    def test_no_state_layers_is_identity(self):
-        self.assertEqual(
-            equalized_block_size(
-                layer_types=["full_attention"] * 4,
-                kv_bytes_per_slot=QWEN3_5ISH_KV_BYTES_PER_SLOT,
-                state_const_bytes={},
-                block_size=64,
-            ),
-            64,
-        )
-
-
 class GdnFlatPoolAssemblyTest(unittest.TestCase):
-    """MHAConfig with state shapes -> create_pool: full-coverage pool with
-    state slabs, both published groups, and the equalized-P geometry gate."""
+    """MHAConfig with state shapes + state shard bin table -> create_pool:
+    full-coverage pool whose state layers carry no KV and expose head-group
+    reinterpret views over the full layers' K/V slabs, with the full group
+    and the k shard groups published."""
 
-    # 3 linear + 1 full; kv row = 2 * 1 head * 8 dim * 2 B = 32 B/slot;
-    # state row = conv (4*3 bf16 = 24 B) + ssm (2*4*4 fp32 = 128 B) = 152 B;
-    # ceil(152 / 32) = 5 > block 4 -> equalized P = 8 (multiple of 4).
+    # 3 linear + 1 full; kv cell = 2 (K+V) * 1 head * 8 dim * 2 B = 32 B/tok
+    # -> segment = 16 * 64 = 1024 B at P=64. ssm head cell = 4*4 fp32 =
+    # 64 B (16 heads/group, so each layer's 2 heads make ONE group); conv
+    # row = 4*3 bf16 = 24 B. 3 ssm segments + 1 conv segment over
+    # 1 full layer * 2 sides -> k = 2 shards.
     LAYER_TYPES = ("linear_attention",) * 3 + ("full_attention",)
     CONV_SHAPE = (4, 3)
     TEMPORAL_SHAPE = (2, 4, 4)
+    PAGE_SIZE = 64
+    SIZE = 256  # 4 pages -> 5 page rows with the null row
 
     def setUp(self):
         try:
@@ -160,9 +117,20 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
         self.torch = torch
         self.MHAConfig = MHAConfig
 
-    def _config(self, page_size: int):
+    def _bin_table(self):
+        return shard_bin_table(
+            num_full_layers=1,
+            num_state_layers=3,
+            ssm_heads_per_layer=self.TEMPORAL_SHAPE[0],
+            ssm_head_bytes=self.TEMPORAL_SHAPE[1] * self.TEMPORAL_SHAPE[2] * 4,
+            conv_bytes_per_layer=self.CONV_SHAPE[0] * self.CONV_SHAPE[1] * 2,
+            kv_cell_bytes_per_tok=32,
+            block_size=self.PAGE_SIZE,
+        )
+
+    def _config(self, *, with_bin_table: bool = True, **overrides):
         torch = self.torch
-        return self.MHAConfig(
+        config = self.MHAConfig(
             device="cpu",
             backend_name=None,
             num_attention_heads=2,
@@ -171,7 +139,7 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
             attn_tp_size=1,
             dtype=torch.bfloat16,
             kv_cache_dtype=torch.bfloat16,
-            page_size=page_size,
+            page_size=self.PAGE_SIZE,
             context_len=64,
             max_bs=2,
             max_graph_bs=2,
@@ -182,43 +150,34 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
             temporal_state_shape=self.TEMPORAL_SHAPE,
             conv_dtype=torch.bfloat16,
             ssm_dtype=torch.float32,
+            **overrides,
         )
+        if with_bin_table:
+            # The registry's flat-GDN branch sets this after solving the
+            # packing; single source of truth for the fan-out k.
+            config.state_bin_table = self._bin_table()
+        return config
 
-    def _pool(self, page_size: int):
+    def _pool(self, **kwargs):
+        config = self._config(**kwargs)
         with mock.patch(_PKG_FLAT_PROBE, return_value=True):
-            return self._config(page_size).create_pool(
-                len(self.LAYER_TYPES), 32, 0, False
-            )
+            return config.create_pool(len(self.LAYER_TYPES), self.SIZE, 0, False)
 
-    def test_equalization_decision_matches_pure_helper(self):
-        self.assertEqual(
-            equalized_block_size(
-                layer_types=list(self.LAYER_TYPES),
-                kv_bytes_per_slot=32,
-                state_const_bytes={"conv": 24, "ssm": 128},
-                block_size=4,
-            ),
-            8,
-        )
-
-    def test_assembly_at_equalized_page_size(self):
-        pool = self._pool(page_size=8)
-        # One (conv, ssm) slab pair per state layer, rows over the shared
-        # page-id space (size // P + 1 null row).
-        self.assertEqual(len(pool.state_slabs), 3)
-        conv, ssm = pool.state_slabs[0]
-        self.assertEqual(tuple(conv.shape), (5, *self.CONV_SHAPE))
-        self.assertEqual(conv.dtype, self.torch.bfloat16)
-        self.assertEqual(tuple(ssm.shape), (5, *self.TEMPORAL_SHAPE))
-        self.assertEqual(ssm.dtype, self.torch.float32)
-        # Both groups published (upstream signal for flat state paging).
+    def test_assembly_with_bin_table(self):
+        torch = self.torch
+        pool = self._pool()
+        # k = 2 shard groups published next to the full-history group
+        # (upstream signal for flat state paging).
         self.assertEqual(
             sorted(spec.group_id for spec in pool.paged_cache_group_specs),
-            ["full_attention", "linear_attention"],
+            [
+                "full_attention",
+                "linear_attention_shard0",
+                "linear_attention_shard1",
+            ],
         )
-        # Plan-sized coverage (M18a T4): the k/v lists stay layer-indexed,
-        # but state layers carry no KV tensors (None slots) -- only the
-        # full-attention layer allocates.
+        # The k/v lists stay layer-indexed, but state layers carry no KV
+        # tensors (None slots) -- only the full-attention layer allocates.
         self.assertEqual(len(pool.k_buffer), len(self.LAYER_TYPES))
         for layer_id, label in enumerate(self.LAYER_TYPES):
             if label == "linear_attention":
@@ -227,10 +186,47 @@ class GdnFlatPoolAssemblyTest(unittest.TestCase):
             else:
                 self.assertIsNotNone(pool.k_buffer[layer_id])
                 self.assertIsNotNone(pool.v_buffer[layer_id])
+        # Each state layer exposes ONE head group (2 heads fit a segment):
+        # views over the page-id space (size // P + 1 null row), the fp32
+        # ssm reinterpret living inside the bf16 KV slab.
+        n = self.SIZE // self.PAGE_SIZE + 1
+        for layer_id in (0, 1, 2):
+            (group,) = pool.get_state_buffers(layer_id)
+            self.assertEqual(tuple(group.conv.shape), (n, *self.CONV_SHAPE))
+            self.assertEqual(group.conv.dtype, torch.bfloat16)
+            self.assertEqual(tuple(group.ssm.shape), (n, *self.TEMPORAL_SHAPE))
+            self.assertEqual(group.ssm.dtype, torch.float32)
+            self.assertEqual((group.head_begin, group.num_heads), (0, 2))
+            # No state memory of its own: the views alias the full layer's
+            # K or V slab storage.
+            slabs = [pool.k_buffer[3], pool.v_buffer[3]]
+            for t in (group.ssm, group.conv):
+                self.assertTrue(
+                    any(
+                        s.data_ptr() <= t.data_ptr() < s.data_ptr() + s.nbytes
+                        for s in slabs
+                    )
+                )
+        self.assertTrue(pool.state_shard_view.is_active)
 
-    def test_geometry_raises_at_original_page_size(self):
-        with self.assertRaisesRegex(ValueError, "pre-equalized"):
-            self._pool(page_size=4)
+    def test_without_bin_table_state_stays_legacy(self):
+        # Transitional off-switch: no bin table -> the flat-GDN gate stays
+        # off, state layers keep per-layer KV, and no shard groups publish.
+        pool = self._pool(with_bin_table=False)
+        self.assertFalse(pool.state_shard_view.is_active)
+        self.assertTrue(all(t is not None for t in pool.k_buffer))
+        self.assertEqual(
+            sorted(spec.group_id for spec in pool.paged_cache_group_specs),
+            ["full_attention", "linear_attention"],
+        )
+        with self.assertRaisesRegex(ValueError, r"views were bound"):
+            pool.get_state_buffers(0)
+
+    def test_pd_disaggregation_rejected_when_active(self):
+        with self.assertRaisesRegex(
+            RuntimeError, r"state binning is incompatible with PD"
+        ):
+            self._pool(pd_disaggregation_enabled=True)
 
 
 if __name__ == "__main__":

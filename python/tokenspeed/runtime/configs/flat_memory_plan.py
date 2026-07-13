@@ -69,8 +69,8 @@ def state_const_bytes(conv_shape, conv_dtype, ssm_shape, ssm_dtype):
 
     Returns:
         dict[str, int]: {"conv": bytes, "ssm": bytes} — the exact
-        ``state_const_bytes`` mapping components_from_layers /
-        equalized_block_size consume (insertion order = row_offset order).
+        ``state_const_bytes`` mapping components_from_layers consumes
+        (insertion order = row_offset order).
     """
     return {
         "conv": math.prod(conv_shape) * conv_dtype.itemsize,
@@ -123,35 +123,6 @@ def solve_page_geometry(components, *, block_size, alignment):
             block_size = alignment * math.ceil(needed / alignment)
     block_bytes = max(max_linear * block_size, max_const)
     return BlockGeometry(block_size=block_size, block_bytes=block_bytes)
-
-
-def equalized_block_size(
-    *,
-    layer_types,
-    kv_bytes_per_slot,
-    state_const_bytes,
-    block_size,
-    alignment=None,
-):
-    """Effective P for a state-hybrid profile: `block_size` when the
-    widest KV row already covers the widest constant state row, else the
-    smallest multiple of `alignment` that does. `alignment` defaults to the
-    original `block_size` (the attention backend's page granularity —
-    no backend declares a finer one), so the inflated P stays a multiple of
-    the configured block size. Pure wrapper over components_from_layers +
-    solve_page_geometry so the config-level equalization decision and its
-    tests share one implementation."""
-    comps = components_from_layers(
-        layer_types=layer_types,
-        kv_bytes_per_slot=kv_bytes_per_slot,
-        state_const_bytes=state_const_bytes,
-    )
-    geo = solve_page_geometry(
-        comps,
-        block_size=block_size,
-        alignment=alignment if alignment is not None else block_size,
-    )
-    return geo.block_size
 
 
 @dataclass(frozen=True)

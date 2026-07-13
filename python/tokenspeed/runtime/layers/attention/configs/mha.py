@@ -49,10 +49,10 @@ class MHAConfig(BaseAttnConfig):
     # guards consume it.
     pd_disaggregation_enabled: bool = False
     # Mamba2/GDN per-state-layer shapes and dtypes (the configs'
-    # mamba2_cache_params), forwarded to the pool's state slabs. Populated
-    # only on a flat-built scheduler ext — the radix path keeps its
-    # SimpleMambaPool state ownership byte-identical (None here means the
-    # pool neither allocates state slabs nor runs the page-geometry check).
+    # mamba2_cache_params), forwarded to the pool's state shard views.
+    # Populated only on a flat-built scheduler ext — the radix path keeps
+    # its SimpleMambaPool state ownership byte-identical (None here means
+    # the pool binds no state views).
     conv_state_shape: tuple[int, ...] | None = None
     temporal_state_shape: tuple[int, ...] | None = None
     conv_dtype: torch.dtype | None = None
@@ -89,8 +89,9 @@ class MHAConfig(BaseAttnConfig):
             and scheduler_ext_flat_kvcache()
         ):
             # GDN hybrid on the flat ext: the KV pool owns the recurrent
-            # state (state slabs), so it needs the mamba2 shapes/dtypes.
-            # Radix branch untouched: SimpleMambaPool owns the state there.
+            # state (shard views over its K/V slabs), so it needs the
+            # mamba2 shapes/dtypes. Radix branch untouched: SimpleMambaPool
+            # owns the state there.
             text_config = getattr(hf_config, "text_config", hf_config)
             (
                 conv_state_shape,
@@ -171,11 +172,9 @@ class MHAConfig(BaseAttnConfig):
             temporal_state_shape=self.temporal_state_shape,
             conv_dtype=self.conv_dtype,
             ssm_dtype=self.ssm_dtype,
-            # Fan-out k derived from the state bin table (M18c state binning);
-            # None everywhere the table is absent -> legacy bare-name groups.
-            num_state_shards=(
-                self.state_bin_table.num_shards
-                if self.state_bin_table is not None
-                else None
-            ),
+            # Single source of truth for the state binning (M18c): the pool
+            # derives the fan-out k and the state views from the table;
+            # None everywhere the table is absent -> legacy bare-name groups
+            # and no state views.
+            state_bin_table=self.state_bin_table,
         )

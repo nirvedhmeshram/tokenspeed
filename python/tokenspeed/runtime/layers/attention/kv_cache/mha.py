@@ -27,11 +27,15 @@ import torch
 from tokenspeed_kernel.ops.kvcache.triton import store_kv_cache
 
 from tokenspeed.runtime.configs import paged_cache_spec
-from tokenspeed.runtime.configs.flat_memory_plan import occurrence_index
+from tokenspeed.runtime.configs.flat_memory_plan import (
+    StateShardBinTable,
+    occurrence_index,
+)
 from tokenspeed.runtime.configs.paged_cache_spec import hybrid_slab_group_size
 from tokenspeed.runtime.layers.attention.kv_cache.base import BaseTokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.flat_state_slabs import (
-    FlatStateSlabs,
+from tokenspeed.runtime.layers.attention.kv_cache.state_shard_view import (
+    StateHeadGroup,
+    StateShardView,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.utils import (
     copy_all_layer_kv_cache_tiled,
@@ -71,7 +75,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         temporal_state_shape: tuple[int, ...] | None = None,
         conv_dtype: torch.dtype | None = None,
         ssm_dtype: torch.dtype | None = None,
-        num_state_shards: int | None = None,
+        state_bin_table: StateShardBinTable | None = None,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -90,13 +94,13 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             self._layer_types,
             sliding_window_tokens=sliding_window_tokens,
         )
-        # GDN/mamba2 recurrent state slabs live under this same pool object
-        # (one page-id space with the KV pages), but their bookkeeping is
-        # owned by FlatStateSlabs. Constructing it here runs the
-        # equalization pre-check (same trigger, same ValueError) before any
-        # buffer allocation; slabs themselves are allocated in
-        # _create_buffers inside the memory-saver region.
-        self._state = FlatStateSlabs(
+        # GDN/mamba2 recurrent state lives INSIDE this pool's K/V slabs (one
+        # page-id space, M18c binning): StateShardView owns the layer ->
+        # head-group bookkeeping and reinterprets the bin table's byte
+        # ranges as typed views. The views are bound in _create_buffers
+        # right after the slabs exist; no state memory is allocated.
+        self._state = StateShardView(
+            bin_table=state_bin_table,
             layer_types=self._layer_types,
             conv_state_shape=conv_state_shape,
             temporal_state_shape=temporal_state_shape,
@@ -105,7 +109,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             default_dtype=dtype,
             page_size=self.page_size,
             size=self.size,
-            kv_bytes_per_slot=2 * head_num * head_dim * self.store_dtype.itemsize,
         )
         self._create_buffers()
 
@@ -138,7 +141,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             max_scheduled_tokens=max_scheduled_tokens,
             max_total_tokens=size,
             max_context_len=max_context_len,
-            num_state_shards=num_state_shards,
+            # Fan-out k stays single-authority: derived from the bin table.
+            num_state_shards=(
+                state_bin_table.num_shards if state_bin_table is not None else None
+            ),
         )
         if published is None:
             self.paged_cache_group_specs = ()
@@ -197,14 +203,27 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                     device=self.device,
                 )
 
-            # State-layer bookkeeping lives in FlatStateSlabs. The KV skip
-            # set below (which layers carry None KV) and the state-slab
-            # allocation are gated by the SAME flat-GDN predicate -- the plan
-            # sizing (registry) charges exactly full-layer KV + state rows,
-            # so the two decisions must never diverge. state_layer_ids is
-            # empty unless the gate is on, so non-flat profiles keep full KV.
+            # State-layer bookkeeping lives in StateShardView. The KV skip
+            # set below (which layers carry None KV) and the state-view
+            # binding are gated by the SAME flat-GDN predicate -- the plan
+            # sizing (registry) charges exactly full-layer KV rows (state is
+            # aliased over them), so the two decisions must never diverge.
+            # state_layer_ids is empty unless the gate is on, so non-flat
+            # profiles keep full KV.
             flat_state_layers = set(self._state.state_layer_ids)
             if self._state.is_active:
+                if self._pd_disaggregation_enabled:
+                    raise RuntimeError(
+                        "flat GDN state binning is incompatible with PD "
+                        "disaggregation: KV transfer registers per-layer "
+                        "buffer pointers (get_contiguous_buf_infos), and "
+                        "the GDN state bytes alias segments inside the full "
+                        "layers' K/V slabs, so per-layer transfers would "
+                        "silently drop (or clobber) the aliased state "
+                        "bytes. Set disaggregation_mode='null' or use a "
+                        "radix-built tokenspeed_scheduler extension, which "
+                        "keeps the legacy per-layer layout."
+                    )
                 # Gates event_loop's retraction offload: state layers carry no
                 # per-layer KV, so the radix offload executor (and its host
                 # pool, sized for ALL layers) cannot represent this pool.
@@ -258,6 +277,20 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                         "or non-uniform/single-group layer_types)",
                         self.layer_num,
                     )
+                if self._state.is_active:
+                    # Bind the GDN state views over the full layers' slabs:
+                    # slot order == layer_id ascending over non-state layers,
+                    # exactly the bin table's slot enumeration. Pure
+                    # reinterprets -- no allocation happens here.
+                    full_layer_ids = [
+                        layer_id
+                        for layer_id in range(self.layer_num)
+                        if layer_id not in flat_state_layers
+                    ]
+                    self._state.bind(
+                        [self.k_buffer[layer_id] for layer_id in full_layer_ids],
+                        [self.v_buffer[layer_id] for layer_id in full_layer_ids],
+                    )
             # Pointer/stride tables carry the REAL tensors only: _kv_copy
             # launches one block per data_ptrs entry (grid = numel), so a
             # placeholder entry for a skipped state layer would be
@@ -279,12 +312,6 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 [np.prod(x.shape[1:]) * x.dtype.itemsize for x in real_k + real_v],
                 device=self.device,
             )
-
-            # State slabs (GDN/mamba2 conv+ssm rows) share this pool's
-            # memory-saver region so they follow the KV discard-on-sleep
-            # policy. FlatStateSlabs.allocate is a no-op (leaving
-            # state_slabs == []) unless the flat-GDN gate is on.
-            self._state.allocate(self.device)
 
     def _init_kv_copy_and_warmup(self):
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
@@ -376,9 +403,10 @@ class MHATokenToKVPool(BaseTokenToKVPool):
                 "flat GDN layout has no per-layer KV on state layers; "
                 "PD disaggregation unsupported: KV transfer registers "
                 "per-layer buffer pointers, and state layers carry only "
-                "state slabs. Set disaggregation_mode='null' or use a "
-                "radix-built tokenspeed_scheduler extension, which keeps "
-                "the full per-layer KV layout."
+                "state views aliased into the full layers' slabs. Set "
+                "disaggregation_mode='null' or use a radix-built "
+                "tokenspeed_scheduler extension, which keeps the full "
+                "per-layer KV layout."
             )
         kv_data_ptrs = [
             self._get_key_buffer(i).data_ptr() for i in range(self.layer_num)
@@ -498,18 +526,19 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     @property
-    def state_slabs(self) -> list[tuple[torch.Tensor, torch.Tensor]]:
-        """(conv, ssm) state slab pairs; [] when no state slabs are active.
+    def state_shard_view(self) -> StateShardView:
+        """The pool's StateShardView (GDN state reinterpret views over the
+        K/V slabs, M18c binning). Inactive views raise on access; probe
+        ``state_shard_view.is_active`` first. The hybrid-linear-attn backend
+        consumes this to page states per (shard, head group)."""
+        return self._state
 
-        Forwarding property: FlatStateSlabs owns the slabs, but the flat
-        host mirror and hybrid-linear-attn backend probe pool.state_slabs
-        directly (getattr), so keep the attribute on the pool."""
-        return self._state.state_slabs
-
-    def get_state_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """(conv, ssm) state slab pair for a state layer; the n-th state
-        layer (within-state-label occurrence order, the slab pairing order)
-        binds pair n. Raises ValueError for non-state layers."""
+    def get_state_buffers(self, layer_id: int) -> list[StateHeadGroup]:
+        """StateHeadGroup list for a state layer: per ssm head group one
+        (conv, ssm, shard, conv_shard, head_begin, num_heads) entry, the
+        conv view repeated across the layer's groups. The n-th state layer
+        (within-state-label occurrence order) binds the n-th bin-table
+        layer. Raises ValueError for non-state layers."""
         return self._state.get_state_buffers(layer_id)
 
     def set_kv_buffer(

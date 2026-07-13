@@ -415,16 +415,6 @@ def create_attn_components(
 
     config = _create_attn_config(server_args, model_config)
     is_flat_gdn = getattr(config, "conv_state_shape", None) is not None
-    gdn_state_bytes = (
-        state_const_bytes(
-            config.conv_state_shape,
-            config.conv_dtype,
-            config.temporal_state_shape,
-            config.ssm_dtype,
-        )
-        if is_flat_gdn
-        else None
-    )
     if is_flat_gdn:
         if server_args.block_size % 64 != 0:
             raise ValueError(
@@ -602,16 +592,14 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
         flat_plan = plan_component_tensors(
-            # state is aliased over the full layers' rows (M18c): not charged per block
-            [
-                c
-                for c in components_from_layers(
-                    layer_types=list(config.layer_types),
-                    kv_bytes_per_slot=config.cache_cell_size(),
-                    state_const_bytes=gdn_state_bytes,
-                )
-                if c.group_id not in STATE_LAYER_TYPES
-            ],
+            # State is aliased over the full layers' rows (M18c): not charged
+            # per block. An empty state_const_bytes makes state layers
+            # contribute no components at all, so no filtering is needed.
+            components_from_layers(
+                layer_types=list(config.layer_types),
+                kv_bytes_per_slot=config.cache_cell_size(),
+                state_const_bytes={},
+            ),
             block_size=server_args.block_size,
             budget_bytes=cache_memory,
             reserved_bytes_per_block=draft_row_bytes,

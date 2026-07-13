@@ -399,22 +399,33 @@ class StatePagedCacheGroupPageCountTest(unittest.TestCase):
         self.assertLess(counts["linear_attention"], counts["full_attention"])
 
 
-class MHAPoolStateSlabTest(unittest.TestCase):
-    """State-slab consumer (kv_cache/mha.py): a GDN hybrid keeps a per-layer
+class MHAPoolStateShardViewTest(unittest.TestCase):
+    """State-view consumer (kv_cache/mha.py): a GDN hybrid keeps a per-layer
     KV layout on attention layers (state layers carry None slots, M18a),
-    and flat ext + provided mamba2 shapes add one (conv, ssm) slab pair per
-    state LAYER, row-indexed by page id (row 0 = null page, never written).
+    and flat ext + mamba2 shapes + a state shard bin table expose per-layer
+    head groups whose conv/ssm tensors are reinterpret views over the full
+    layers' K/V slabs (M18c) -- row-indexed by page id (row 0 = null page,
+    never written), no state memory of their own.
     Constructs a real (tiny, CPU) MHATokenToKVPool; skips without deps.
     Patch target is the PACKAGE paged_cache_spec probe (see above).
     """
 
+    # cell = 2 * 1 head * 8 dim * 2 B = 32 B/tok -> segment 1024 B at P=64;
+    # ssm head cell = 4*4 fp32 = 64 B (both heads of a layer make ONE
+    # group); conv row = 4*8 fp32 = 128 B. 2 ssm + 1 conv segment over
+    # 2 full layers * 2 sides -> k = 1 shard.
     CONV_SHAPE = (4, 8)
     SSM_SHAPE = (2, 4, 4)
+    PAGE_SIZE = 64
+    SIZE = 128
 
     def setUp(self):
         try:
             import torch
 
+            from tokenspeed.runtime.configs.flat_memory_plan import (
+                shard_bin_table,
+            )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
@@ -422,10 +433,22 @@ class MHAPoolStateSlabTest(unittest.TestCase):
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.shard_bin_table = shard_bin_table
+
+    def _bin_table(self):
+        return self.shard_bin_table(
+            num_full_layers=2,
+            num_state_layers=2,
+            ssm_heads_per_layer=self.SSM_SHAPE[0],
+            ssm_head_bytes=self.SSM_SHAPE[1] * self.SSM_SHAPE[2] * 4,
+            conv_bytes_per_layer=self.CONV_SHAPE[0] * self.CONV_SHAPE[1] * 4,
+            kv_cell_bytes_per_tok=32,
+            block_size=self.PAGE_SIZE,
+        )
 
     def _pool(self, *, flat_ext: bool = True, **overrides):
         kwargs = dict(
-            size=32,
+            size=self.SIZE,
             dtype=self.torch.bfloat16,
             head_num=1,
             head_dim=8,
@@ -434,7 +457,7 @@ class MHAPoolStateSlabTest(unittest.TestCase):
             enable_memory_saver=False,
             max_batch_size=2,
             max_context_len=64,
-            page_size=16,
+            page_size=self.PAGE_SIZE,
             rank=0,
             layer_types=GDN_LAYER_TYPES,
             sliding_window_tokens=None,
@@ -443,12 +466,13 @@ class MHAPoolStateSlabTest(unittest.TestCase):
             temporal_state_shape=self.SSM_SHAPE,
             conv_dtype=self.torch.float32,
             ssm_dtype=self.torch.float32,
+            state_bin_table=self._bin_table(),
         )
         kwargs.update(overrides)
         with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
             return self.MHATokenToKVPool(**kwargs)
 
-    def test_state_slabs_one_pair_per_state_layer(self):
+    def test_state_views_one_group_per_state_layer(self):
         pool = self._pool()
         # KV side stays per-layer (no aliasing), but flat GDN state layers
         # (0/2) carry no KV tensors -- None slots (M18a T4).
@@ -456,48 +480,76 @@ class MHAPoolStateSlabTest(unittest.TestCase):
         self.assertIsNone(pool.k_buffer[0])
         self.assertIsNone(pool.k_buffer[2])
         self.assertEqual(len({id(t) for t in pool.k_buffer if t is not None}), 2)
-        self.assertEqual(len(pool.state_slabs), 2)
-        num_pages_with_null = 32 // 16 + 1  # row 0 = null page
-        for conv, ssm in pool.state_slabs:
-            self.assertEqual(conv.shape, (num_pages_with_null, *self.CONV_SHAPE))
-            self.assertEqual(ssm.shape, (num_pages_with_null, *self.SSM_SHAPE))
-            self.assertEqual(conv.dtype, self.torch.float32)
-            self.assertEqual(ssm.dtype, self.torch.float32)
+        self.assertTrue(pool.state_shard_view.is_active)
+        num_pages_with_null = self.SIZE // self.PAGE_SIZE + 1  # row 0 = null
+        slabs = [pool.k_buffer[1], pool.k_buffer[3], pool.v_buffer[1], pool.v_buffer[3]]
+        for layer_id in (0, 2):
+            (group,) = pool.get_state_buffers(layer_id)
+            self.assertEqual(group.conv.shape, (num_pages_with_null, *self.CONV_SHAPE))
+            self.assertEqual(group.ssm.shape, (num_pages_with_null, *self.SSM_SHAPE))
+            self.assertEqual(group.conv.dtype, self.torch.float32)
+            self.assertEqual(group.ssm.dtype, self.torch.float32)
+            self.assertEqual((group.head_begin, group.num_heads), (0, 2))
+            # No state memory of its own: views alias the K/V slab storage.
+            for t in (group.ssm, group.conv):
+                self.assertTrue(
+                    any(
+                        s.data_ptr() <= t.data_ptr() < s.data_ptr() + s.nbytes
+                        for s in slabs
+                    )
+                )
 
     def test_get_state_buffers_occurrence_indexed(self):
         pool = self._pool()
-        # Layers 0 and 2 are the 0th/1st linear layers -> pairs 0/1.
-        self.assertIs(pool.get_state_buffers(0)[0], pool.state_slabs[0][0])
-        self.assertIs(pool.get_state_buffers(0)[1], pool.state_slabs[0][1])
-        self.assertIs(pool.get_state_buffers(2)[0], pool.state_slabs[1][0])
-        self.assertIs(pool.get_state_buffers(2)[1], pool.state_slabs[1][1])
+        # Layers 0 and 2 are the 0th/1st linear layers -> bin-table layers
+        # 0/1: ssm segments land on slot 0's K then V slab (byte offset 0),
+        # and both conv rows pack into slot 1's K slab at offsets 0 / 128.
+        (g0,) = pool.get_state_buffers(0)
+        (g2,) = pool.get_state_buffers(2)
+        self.assertEqual(g0.ssm.data_ptr(), pool.k_buffer[1].data_ptr())
+        self.assertEqual(g2.ssm.data_ptr(), pool.v_buffer[1].data_ptr())
+        self.assertEqual(g0.conv.data_ptr(), pool.k_buffer[3].data_ptr())
+        self.assertEqual(g2.conv.data_ptr(), pool.k_buffer[3].data_ptr() + 128)
         with self.assertRaisesRegex(ValueError, r"not a state layer"):
             pool.get_state_buffers(1)
 
-    def test_no_state_shapes_no_slabs(self):
+    def test_no_state_shapes_no_views(self):
+        # Missing shapes switch the gate off even with a bin table present.
         pool = self._pool(
             conv_state_shape=None,
             temporal_state_shape=None,
             conv_dtype=None,
             ssm_dtype=None,
         )
-        self.assertEqual(pool.state_slabs, [])
+        self.assertFalse(pool.state_shard_view.is_active)
+        with self.assertRaisesRegex(ValueError, r"views were bound"):
+            pool.get_state_buffers(0)
 
-    def test_radix_ext_no_slabs(self):
+    def test_no_bin_table_stays_legacy(self):
+        # Transitional off-switch: no bin table -> full per-layer KV, no
+        # state views.
+        pool = self._pool(state_bin_table=None)
+        self.assertFalse(pool.state_shard_view.is_active)
+        self.assertTrue(all(t is not None for t in pool.k_buffer))
+        with self.assertRaisesRegex(ValueError, r"views were bound"):
+            pool.get_state_buffers(0)
+
+    def test_radix_ext_no_views(self):
         pool = self._pool(flat_ext=False)
-        self.assertEqual(pool.state_slabs, [])
+        self.assertFalse(pool.state_shard_view.is_active)
+        with self.assertRaisesRegex(ValueError, r"views were bound"):
+            pool.get_state_buffers(0)
 
-    def test_under_equalized_page_size_raises(self):
-        # conv row 4096 B vs 512 B linear KV row (32 B/slot * P=16): the
-        # plan would inflate P to 132, so the pre-equalized check rejects.
-        with self.assertRaisesRegex(ValueError, r"pre-equalized.*need >= "):
-            self._pool(conv_state_shape=(1024,))
-
-    def test_published_state_group_count_positive_and_bounded(self):
+    def test_published_shard_group_counts_positive_and_bounded(self):
+        # k = 1 for this packing: the state group publishes as
+        # linear_attention_shard0 (never the bare name).
         pool = self._pool()
         counts = pool.paged_cache_group_page_counts
-        self.assertGreater(counts["linear_attention"], 0)
-        self.assertLessEqual(counts["linear_attention"], counts["full_attention"])
+        self.assertNotIn("linear_attention", counts)
+        self.assertGreater(counts["linear_attention_shard0"], 0)
+        self.assertLessEqual(
+            counts["linear_attention_shard0"], counts["full_attention"]
+        )
 
 
 # Qwen3.5-ish interleaving: 3 linear layers then 1 full, times 12 (48 layers).
@@ -520,13 +572,16 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
     SSM_SHAPE = (2, 4, 4)
     NUM_LAYERS = 48
     NUM_FULL = 12
-    SIZE = 32
-    PAGE_SIZE = 16
+    SIZE = 128
+    PAGE_SIZE = 64
 
     def setUp(self):
         try:
             import torch
 
+            from tokenspeed.runtime.configs.flat_memory_plan import (
+                shard_bin_table,
+            )
             from tokenspeed.runtime.layers.attention.kv_cache.mha import (
                 MHATokenToKVPool,
             )
@@ -534,6 +589,18 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.MHATokenToKVPool = MHATokenToKVPool
+        self.shard_bin_table = shard_bin_table
+
+    def _bin_table(self):
+        return self.shard_bin_table(
+            num_full_layers=self.NUM_FULL,
+            num_state_layers=self.NUM_LAYERS - self.NUM_FULL,
+            ssm_heads_per_layer=self.SSM_SHAPE[0],
+            ssm_head_bytes=self.SSM_SHAPE[1] * self.SSM_SHAPE[2] * 4,
+            conv_bytes_per_layer=self.CONV_SHAPE[0] * self.CONV_SHAPE[1] * 4,
+            kv_cell_bytes_per_tok=32,
+            block_size=self.PAGE_SIZE,
+        )
 
     def _pool(self, *, flat_ext: bool = True, **overrides):
         kwargs = dict(
@@ -555,6 +622,7 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
             temporal_state_shape=self.SSM_SHAPE,
             conv_dtype=self.torch.float32,
             ssm_dtype=self.torch.float32,
+            state_bin_table=self._bin_table(),
         )
         kwargs.update(overrides)
         with mock.patch(_PKG_FLAT_PROBE, return_value=flat_ext):
@@ -572,8 +640,12 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
             else:
                 self.assertEqual(pool.k_buffer[layer_id].shape[0], rows)
                 self.assertEqual(pool.v_buffer[layer_id].shape[0], rows)
-        # State slabs still cover every state layer.
-        self.assertEqual(len(pool.state_slabs), self.NUM_LAYERS - self.NUM_FULL)
+        # State views still cover every state layer (reinterpret views over
+        # the full layers' slabs; no state memory of their own).
+        for layer_id, label in enumerate(QWEN_LIKE_LAYER_TYPES):
+            if label == "linear_attention":
+                (group,) = pool.get_state_buffers(layer_id)
+                self.assertEqual(group.ssm.shape[0], self.SIZE // self.PAGE_SIZE + 1)
 
     def test_flat_gdn_data_ptrs_exclude_none(self):
         # _kv_copy launches one block per data_ptrs entry (grid = numel), so
@@ -628,13 +700,14 @@ class FlatGDNStateLayerNoKVTest(unittest.TestCase):
         self.assertEqual(pool.k_buffer[3].abs().sum().item(), 0.0)
 
     def test_radix_pool_unaffected(self):
-        # Zero-impact pin: without the flat ext the same layer_types keep
-        # full per-layer KV coverage and no state slabs.
+        # Zero-impact pin: without the flat ext the same layer_types (and
+        # even a present bin table) keep full per-layer KV coverage and no
+        # state views.
         pool = self._pool(flat_ext=False)
         self.assertTrue(all(t is not None for t in pool.k_buffer))
         self.assertTrue(all(t is not None for t in pool.v_buffer))
         self.assertEqual(pool.data_ptrs.numel(), 2 * self.NUM_LAYERS)
-        self.assertEqual(pool.state_slabs, [])
+        self.assertFalse(pool.state_shard_view.is_active)
         pool.get_contiguous_buf_infos()  # PD surface stays available
         self.assertTrue(pool.supports_hierarchical_kv_cache)
 
