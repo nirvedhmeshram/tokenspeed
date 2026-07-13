@@ -226,6 +226,20 @@ class MambaForwardMetadata:
     state_in_pages_i64: torch.Tensor | None = None
     state_out_pages_i64: torch.Tensor | None = None
     state_fresh_mask: torch.Tensor | None = None
+    # Flat prefill boundary harvest (flat counterpart of the radix track_*
+    # fields): each extend chunk's LAST interior whole-page boundary state is
+    # scattered into that boundary page. Compact over the m tracked requests;
+    # per-shard page/sel pairs are pre-filtered of holes/pads and the
+    # forbidden null row 0.
+    flat_track_mask: torch.Tensor | None = None  # [bs] bool
+    flat_track_lens: torch.Tensor | None = None  # [bs] chunk-relative bounds
+    flat_track_ssm_src: torch.Tensor | None = None  # [m] FLASHINFER grid
+    flat_track_ssm_src_fla: torch.Tensor | None = None  # [m] FLA 64 grid
+    flat_track_pages: tuple[torch.Tensor, ...] | None = None  # k x [m_s] i64
+    flat_track_sel: tuple[torch.Tensor, ...] | None = None  # k x [m_s] into m
+    # Lazily filled on the first state layer's forward (needs conv_state_len
+    # from the bound views); shared by the rest of the step's layers.
+    flat_track_conv_indices: torch.Tensor | None = None  # [m, conv_len]
 
 
 class LayerMappedKVPool:
@@ -621,6 +635,26 @@ class MambaAttnBackend(AttentionBackend):
         )
         self._flat_state_page_size = int(getattr(kv_pool, "page_size", 1))
 
+    def _stack_shard_rows(self, bs: int, kwargs: dict) -> torch.Tensor:
+        """[k, bs, W] stack of the k shard block tables (a view when k == 1);
+        fails loud on a missing shard table."""
+        flat_tables = kwargs.get("flat_block_tables")
+        shard_ids = self._shard_group_ids
+        missing = [
+            gid for gid in shard_ids if not flat_tables or gid not in flat_tables
+        ]
+        if missing:
+            raise RuntimeError(
+                "MambaAttnBackend: flat state paging is active (pool "
+                f"publishes {self._num_state_shards} "
+                f"{_STATE_SHARD_PREFIX}* groups) but flat_block_tables is "
+                f"missing {missing!r} "
+                f"(got {sorted(flat_tables) if flat_tables else flat_tables!r})"
+            )
+        if len(shard_ids) == 1:
+            return flat_tables[shard_ids[0]][:bs].unsqueeze(0)
+        return torch.stack([flat_tables[gid][:bs] for gid in shard_ids], dim=0)
+
     def _flat_state_pages(
         self,
         bs: int,
@@ -647,19 +681,6 @@ class MambaAttnBackend(AttentionBackend):
         """
         if validate is None:
             validate = os.environ.get("TOKENSPEED_FLAT_DEBUG") == "1"
-        flat_tables = kwargs.get("flat_block_tables")
-        shard_ids = self._shard_group_ids
-        missing = [
-            gid for gid in shard_ids if not flat_tables or gid not in flat_tables
-        ]
-        if missing:
-            raise RuntimeError(
-                "MambaAttnBackend: flat state paging is active (pool "
-                f"publishes {self._num_state_shards} "
-                f"{_STATE_SHARD_PREFIX}* groups) but flat_block_tables is "
-                f"missing {missing!r} "
-                f"(got {sorted(flat_tables) if flat_tables else flat_tables!r})"
-            )
         after = seq_lens[:bs]
         if forward_mode.is_decode_or_idle():
             before = after - 1
@@ -674,10 +695,7 @@ class MambaAttnBackend(AttentionBackend):
         # One [k, bs, W] stack (a view when k == 1), then a single batched
         # dual-index over all shards -- the per-request slot math runs once
         # instead of k times.
-        if len(shard_ids) == 1:
-            rows = flat_tables[shard_ids[0]][:bs].unsqueeze(0)
-        else:
-            rows = torch.stack([flat_tables[gid][:bs] for gid in shard_ids], dim=0)
+        rows = self._stack_shard_rows(bs, kwargs)
         state_in, state_out = compute_state_page_indices_batched(
             rows,
             self._flat_state_page_size,
@@ -820,65 +838,84 @@ class MambaAttnBackend(AttentionBackend):
         track_conv_indices = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        flat_track_mask = None
+        flat_track_lens = None
+        flat_track_ssm_src = None
+        flat_track_ssm_src_fla = None
+        flat_track_pages = None
+        flat_track_sel = None
         if (
-            (forward_mode.is_extend_or_mixed() or is_draft_extend)
-            and not is_target_verify
-            # Radix-only prefix snapshot tracking: flat mode snapshots states
-            # via page claiming (dual-index), and track indices address the
-            # SimpleMambaPool row space, not the state slabs.
-            and not self.flat_state_active
-        ):
-            extend_prefix_lens_kw = kwargs.get("extend_prefix_lens")
-            mamba_track_pool_indices = kwargs.get("mamba_track_pool_indices")
-            if (
-                extend_prefix_lens_kw is not None
-                and mamba_track_pool_indices is not None
-            ):
-                prefix = extend_prefix_lens_kw[:bs].to(
-                    dtype=torch.int32, device=self.device
+            forward_mode.is_extend_or_mixed() or is_draft_extend
+        ) and not is_target_verify:
+            if self.flat_state_active:
+                # Flat prefix snapshots: harvest the chunk's last interior
+                # page-boundary state into that boundary page (radix instead
+                # tracks into the SimpleMambaPool row space below).
+                flat_track = self._flat_boundary_track_metadata(
+                    bs, seq_lens, state_seq_lens_before, kwargs
                 )
-                track_indices = mamba_track_pool_indices[:bs].to(
-                    dtype=torch.int32, device=self.device
-                )
-                extend_lens = (seq_lens[:bs] - prefix).to(torch.int32)
-                checkpoint_mask = (track_indices >= 0) & (mamba_cache_indices >= 0)
-
-                page_size = getattr(self.pool, "page_size", 1)
-                final_lens = prefix + extend_lens
-                last_inserted_lens = (final_lens // page_size) * page_size
-                track_lens = last_inserted_lens - prefix
-                track_inside = (
-                    checkpoint_mask & (track_lens > 0) & (track_lens < extend_lens)
-                )
-                track_mask = track_inside & ((track_lens % FLA_CHUNK_SIZE) == 0)
-                # C++ attaches the checkpoint slot to the last KV page inserted
-                # for this chunk. When a chunk has an intermediate branch and
-                # ends exactly on a page boundary, the final state must win.
-                final_mask = (
-                    checkpoint_mask
-                    & (final_lens >= page_size)
-                    & ((final_lens % page_size) == 0)
-                )
-                if final_mask.any():
-                    track_ssm_final_src = mamba_cache_indices[final_mask]
-                    track_ssm_final_dst = track_indices[final_mask]
-
-                if track_mask.any():
+                if flat_track is not None:
                     (
-                        track_ssm_h_src,
-                        track_ssm_h_src_fla,
-                        track_ssm_h_dst,
-                    ) = self._compute_track_ssm_indices(
-                        track_lens,
-                        track_mask,
-                        track_indices,
-                        seq_lens[:bs] - prefix,  # extend_seq_lens
+                        flat_track_mask,
+                        flat_track_lens,
+                        flat_track_ssm_src,
+                        flat_track_ssm_src_fla,
+                        flat_track_pages,
+                        flat_track_sel,
+                    ) = flat_track
+            else:
+                extend_prefix_lens_kw = kwargs.get("extend_prefix_lens")
+                mamba_track_pool_indices = kwargs.get("mamba_track_pool_indices")
+                if (
+                    extend_prefix_lens_kw is not None
+                    and mamba_track_pool_indices is not None
+                ):
+                    prefix = extend_prefix_lens_kw[:bs].to(
+                        dtype=torch.int32, device=self.device
                     )
-                    track_conv_indices = self._compute_track_conv_indices(
-                        query_start_loc,
-                        track_lens,
-                        track_mask,
+                    track_indices = mamba_track_pool_indices[:bs].to(
+                        dtype=torch.int32, device=self.device
                     )
+                    extend_lens = (seq_lens[:bs] - prefix).to(torch.int32)
+                    checkpoint_mask = (track_indices >= 0) & (mamba_cache_indices >= 0)
+
+                    page_size = getattr(self.pool, "page_size", 1)
+                    final_lens = prefix + extend_lens
+                    last_inserted_lens = (final_lens // page_size) * page_size
+                    track_lens = last_inserted_lens - prefix
+                    track_inside = (
+                        checkpoint_mask & (track_lens > 0) & (track_lens < extend_lens)
+                    )
+                    track_mask = track_inside & ((track_lens % FLA_CHUNK_SIZE) == 0)
+                    # C++ attaches the checkpoint slot to the last KV page
+                    # inserted for this chunk. When a chunk has an intermediate
+                    # branch and ends exactly on a page boundary, the final
+                    # state must win.
+                    final_mask = (
+                        checkpoint_mask
+                        & (final_lens >= page_size)
+                        & ((final_lens % page_size) == 0)
+                    )
+                    if final_mask.any():
+                        track_ssm_final_src = mamba_cache_indices[final_mask]
+                        track_ssm_final_dst = track_indices[final_mask]
+
+                    if track_mask.any():
+                        (
+                            track_ssm_h_src,
+                            track_ssm_h_src_fla,
+                            track_ssm_h_dst,
+                        ) = self._compute_track_ssm_indices(
+                            track_lens,
+                            track_mask,
+                            track_indices,
+                            seq_lens[:bs] - prefix,  # extend_seq_lens
+                        )
+                        track_conv_indices = self._compute_track_conv_indices(
+                            query_start_loc,
+                            track_lens,
+                            track_mask,
+                        )
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
@@ -899,6 +936,12 @@ class MambaAttnBackend(AttentionBackend):
             state_in_pages_i64=state_in_pages_i64,
             state_out_pages_i64=state_out_pages_i64,
             state_fresh_mask=state_fresh_mask,
+            flat_track_mask=flat_track_mask,
+            flat_track_lens=flat_track_lens,
+            flat_track_ssm_src=flat_track_ssm_src,
+            flat_track_ssm_src_fla=flat_track_ssm_src_fla,
+            flat_track_pages=flat_track_pages,
+            flat_track_sel=flat_track_sel,
         )
 
     def _compute_track_conv_indices(
@@ -906,9 +949,11 @@ class MambaAttnBackend(AttentionBackend):
         query_start_loc: torch.Tensor,
         track_lens: torch.Tensor,
         track_mask: torch.Tensor,
+        conv_state_len: int | None = None,
     ):
         """Compute packed input indices for conv windows at tracked boundaries."""
-        conv_state_len = self.pool.conv_state.shape[-1]
+        if conv_state_len is None:
+            conv_state_len = self.pool.conv_state.shape[-1]
         lens_m = track_lens[track_mask]
         start = query_start_loc[:-1][track_mask] + lens_m - conv_state_len
         indices = start.unsqueeze(-1) + torch.arange(
@@ -917,6 +962,34 @@ class MambaAttnBackend(AttentionBackend):
             dtype=start.dtype,
         )
         return indices.clamp(0, query_start_loc[-1] - 1)
+
+    @staticmethod
+    def _compute_boundary_ssm_src(
+        track_lens: torch.Tensor,
+        track_mask: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        fi_interval: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(src_fi, src_fla) checkpoint indices of the masked boundary states.
+
+        ``fi_interval`` is the FLASHINFER checkpoint grid (the
+        ``checkpoint_interval`` the kernel will run with); the FLA ``h``
+        workspace is always on the fixed FLA_CHUNK_SIZE grid.
+        """
+        # flashinfer ckpts[k] = state after interval k = FLA h[k+1]
+        num_fi_ckpts = extend_seq_lens // fi_interval
+        offset = torch.zeros_like(num_fi_ckpts)
+        offset[1:] = torch.cumsum(num_fi_ckpts[:-1], dim=0)
+        num_fla_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
+        fla_offset = torch.zeros_like(num_fla_states)
+        fla_offset[1:] = torch.cumsum(num_fla_states[:-1], dim=0)
+
+        lens_m = track_lens[track_mask]
+        # FLA h[lens//C] = state after the first `lens` tokens (h[0] = h0);
+        # track_mask guarantees lens_m is on-grid and >= one interval.
+        src_fi = offset[track_mask] + (lens_m // fi_interval - 1)
+        src_fla = fla_offset[track_mask] + (lens_m // FLA_CHUNK_SIZE)
+        return src_fi, src_fla
 
     def _compute_track_ssm_indices(
         self,
@@ -929,30 +1002,64 @@ class MambaAttnBackend(AttentionBackend):
 
         Matching conv windows are gathered separately from packed pre-conv inputs.
         """
-        # flashinfer ckpts[k] = state after processing chunk k = FLA h[k+1]
-        num_fi_ckpts = extend_seq_lens // FLA_CHUNK_SIZE
-        offset = torch.zeros_like(num_fi_ckpts)
-        offset[1:] = torch.cumsum(num_fi_ckpts[:-1], dim=0)
-        num_fla_states = (extend_seq_lens - 1) // FLA_CHUNK_SIZE + 1
-        fla_offset = torch.zeros_like(num_fla_states)
-        fla_offset[1:] = torch.cumsum(num_fla_states[:-1], dim=0)
-
-        lens_m = track_lens[track_mask]
-        offset_m = offset[track_mask]
-        fla_offset_m = fla_offset[track_mask]
-        dst_m = mamba_track_indices[track_mask]
-
-        # FLA h[lens//C] = flashinfer ckpts[lens//C - 1].
-        # track_mask guarantees lens_m >= FLA_CHUNK_SIZE so lens_m // C >= 1.
-        track_ssm_h_src = offset_m + (lens_m // FLA_CHUNK_SIZE - 1)
-        track_ssm_h_src_fla = fla_offset_m + (lens_m // FLA_CHUNK_SIZE)
-        track_ssm_h_dst = dst_m
-
-        return (
-            track_ssm_h_src,
-            track_ssm_h_src_fla,
-            track_ssm_h_dst,
+        src_fi, src_fla = self._compute_boundary_ssm_src(
+            track_lens, track_mask, extend_seq_lens, FLA_CHUNK_SIZE
         )
+        return src_fi, src_fla, mamba_track_indices[track_mask]
+
+    def _flat_boundary_track_metadata(
+        self,
+        bs: int,
+        seq_lens: torch.Tensor,
+        before: torch.Tensor | None,
+        kwargs: dict,
+    ):
+        """Harvest metadata for the chunk's LAST interior whole-page boundary.
+
+        Returns ``(mask, track_lens, src_fi, src_fla, pages, sel)`` or
+        ``None`` when no request harvests. The kernel checkpoints on the
+        P-token grid (FLASHINFER) / the fixed 64-token grid (FLA), so the
+        boundary must be grid-aligned: P % FLA_CHUNK_SIZE (real pools satisfy
+        it by registry construction) and track_lens % P (<=> the chunk starts
+        page-aligned).
+        """
+        P = self._flat_state_page_size
+        if before is None or P % FLA_CHUNK_SIZE != 0:
+            return None
+        final_lens = seq_lens[:bs].to(torch.int64)
+        prefix = before.to(torch.int64)
+        extend_lens = final_lens - prefix
+        last_inserted = (final_lens // P) * P
+        track_lens = last_inserted - prefix
+        # Strictly interior boundaries only: a chunk ending ON a page
+        # boundary already lands that state via the kernel's final-state
+        # write (state_out IS the boundary page there).
+        mask = (track_lens > 0) & (track_lens < extend_lens) & (track_lens % P == 0)
+        # Host sync is fine: extend never runs under CUDA-graph capture/replay
+        # (the radix branch below relies on the same property).
+        if not bool(mask.any()):
+            return None
+        src_fi, src_fla = self._compute_boundary_ssm_src(
+            track_lens, mask, extend_lens, P
+        )
+        rows = self._stack_shard_rows(bs, kwargs)
+        slot = (last_inserted // P - 1).clamp(min=0)
+        pages_all = rows.gather(
+            2, slot.view(1, bs, 1).expand(rows.shape[0], bs, 1)
+        ).squeeze(2)
+        pages_m = pages_all[:, mask]
+        pages, sel = [], []
+        for shard_pages in pages_m:
+            # Boundary page is a hole (0: never write the aliased null row)
+            # or a pad (-1): skip that request's harvest on this shard.
+            keep = (shard_pages > 0).nonzero(as_tuple=False).squeeze(1)
+            sel.append(keep)
+            pages.append(shard_pages[keep].to(torch.int64))
+        if all(s.numel() == 0 for s in sel):
+            # Every boundary page is a hole: don't pay the kernel's
+            # checkpoint write for a no-op scatter.
+            return None
+        return mask, track_lens, src_fi, src_fla, tuple(pages), tuple(sel)
 
     # ---- CUDA graph state ----
 
@@ -1529,6 +1636,9 @@ class MambaAttnBackend(AttentionBackend):
                 self.forward_metadata.track_ssm_h_src is not None
                 and self.forward_metadata.track_ssm_h_src.numel() > 0
             )
+            need_flat_track = (
+                use_flat and self.forward_metadata.flat_track_ssm_src is not None
+            )
 
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
             if extend_seq_lens_cpu is not None:
@@ -1544,6 +1654,25 @@ class MambaAttnBackend(AttentionBackend):
                 conv_states[self.forward_metadata.track_ssm_h_dst] = mixed_qkv_t[
                     :, self.forward_metadata.track_conv_indices
                 ].transpose(0, 1)
+            if need_flat_track:
+                # Boundary conv window = the raw (pre-conv) inputs of the last
+                # kernel-1 tokens before the boundary, written into the
+                # boundary page of the layer's conv view (once per layer).
+                md = self.forward_metadata
+                if md.flat_track_conv_indices is None:
+                    # Lazy: conv_state_len only arrives with the bound views.
+                    md.flat_track_conv_indices = self._compute_track_conv_indices(
+                        query_start_loc,
+                        md.flat_track_lens,
+                        md.flat_track_mask,
+                        conv_state_len=conv_states.shape[-1],
+                    )
+                sel = md.flat_track_sel[conv_group.conv_shard]
+                conv_states[md.flat_track_pages[conv_group.conv_shard]] = (
+                    mixed_qkv_t[:, md.flat_track_conv_indices[sel]]
+                    .transpose(0, 1)
+                    .to(conv_states.dtype)
+                )
 
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv_t,
@@ -1618,53 +1747,51 @@ class MambaAttnBackend(AttentionBackend):
 
             fi_h_checkpoints = None
             h_src = None
-            if need_h_track:
-                gdn_result = gdn_chunk_prefill(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    scale=head_k_dim**-0.5,
-                    initial_state=recurrent_state,
-                    cu_seqlens=query_start_loc,
-                    qk_l2norm=True,
-                    output_final_state=True,
-                    output_h=True,
-                )
-                core_attn_out = gdn_result.out
-                last_recurrent_state = gdn_result.final_state
+            need_track = need_h_track or need_flat_track
+            gdn_result = gdn_chunk_prefill(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                scale=head_k_dim**-0.5,
+                initial_state=recurrent_state,
+                cu_seqlens=query_start_loc,
+                qk_l2norm=True,
+                output_final_state=True,
+                output_h=need_track,
+                # Flat boundaries live on the state-page grid; None keeps the
+                # radix path on the historical 64-token grid, byte-identical.
+                checkpoint_interval=(
+                    self._flat_state_page_size if need_flat_track else None
+                ),
+            )
+            core_attn_out = gdn_result.out
+            last_recurrent_state = gdn_result.final_state
+            if need_track:
                 if gdn_result.h is None:
                     raise RuntimeError(
                         "gdn_chunk_prefill(output_h=True) must return checkpoints"
                     )
                 if gdn_result.h_layout is GdnCheckpointLayout.FLASHINFER:
                     fi_h_checkpoints = gdn_result.h
-                    h_src = self.forward_metadata.track_ssm_h_src
+                    h_src = (
+                        self.forward_metadata.flat_track_ssm_src
+                        if need_flat_track
+                        else self.forward_metadata.track_ssm_h_src
+                    )
                 elif gdn_result.h_layout is GdnCheckpointLayout.FLA:
                     fi_h_checkpoints = gdn_result.h.squeeze(0)
-                    h_src = self.forward_metadata.track_ssm_h_src_fla
+                    h_src = (
+                        self.forward_metadata.flat_track_ssm_src_fla
+                        if need_flat_track
+                        else self.forward_metadata.track_ssm_h_src_fla
+                    )
                 else:
                     raise RuntimeError(
                         "gdn_chunk_prefill(output_h=True) returned unsupported "
                         f"checkpoint layout {gdn_result.h_layout}"
                     )
-            else:
-                gdn_result = gdn_chunk_prefill(
-                    query,
-                    key,
-                    value,
-                    g,
-                    beta,
-                    scale=head_k_dim**-0.5,
-                    initial_state=recurrent_state,
-                    cu_seqlens=query_start_loc,
-                    qk_l2norm=True,
-                    output_final_state=True,
-                    output_h=False,
-                )
-                core_attn_out = gdn_result.out
-                last_recurrent_state = gdn_result.final_state
             if use_flat:
                 # Scatter each group's head slice back through its strided
                 # view (advanced-indexing WRITE on the view itself; never
@@ -1686,6 +1813,20 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_states[self.forward_metadata.track_ssm_h_dst] = fi_h_checkpoints[
                     h_src
                 ].to(ssm_states.dtype, copy=False)
+
+            if need_flat_track:
+                # Boundary ssm state into the boundary page's head-group views
+                # (advanced-indexing WRITE on the strided views; fp32 ckpts ->
+                # fp32 ssm, no rounding). The page then satisfies the C++
+                # final-page registration predicate and becomes hittable.
+                md = self.forward_metadata
+                for grp in head_groups:
+                    sel = md.flat_track_sel[grp.shard]
+                    grp.ssm[md.flat_track_pages[grp.shard]] = fi_h_checkpoints[
+                        h_src[sel]
+                    ][:, grp.head_begin : grp.head_begin + grp.num_heads].to(
+                        grp.ssm.dtype, copy=False
+                    )
 
             if need_final_track:
                 fused_mamba_state_copy(
