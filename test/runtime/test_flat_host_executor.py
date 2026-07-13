@@ -26,10 +26,11 @@ _PKG_FLAT_PROBE = (
 
 LAYER_TYPES = ("sliding_attention", "full_attention") * 2
 
-# GDN hybrid: layers 0/2 are state layers (slab pairs 0/1); the KV side
-# stays per-layer (linear_attention disables slab pairing) but state layers
-# carry no KV tensors under the flat predicate (M18a T4), and the LAST
-# layer is an attention layer -- exercising the finish-event pin.
+# GDN hybrid: layers 0/2 are state layers; the KV side stays per-layer
+# (linear_attention disables slab pairing) but state layers carry no KV
+# tensors under the flat predicate (M18a T4) -- their state bytes alias
+# segments inside the full layers' K/V slabs (M18c binning) -- and the
+# LAST layer is an attention layer, exercising the finish-event pin.
 GDN_LAYER_TYPES = ("linear_attention", "full_attention") * 2
 
 
@@ -324,8 +325,23 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self._drain(executor, 1)
 
     def _state_pool(self):
+        from tokenspeed.runtime.configs.flat_memory_plan import shard_bin_table
+
+        # cell = 2 * 1 head * 8 dim * 2 B = 32 B/tok; both state dtypes
+        # default to the pool's bf16, so ssm head cell = 8 * 2 B and conv
+        # row = 2*4 * 2 B; everything packs into shard 0 of the 2 full
+        # layers' slabs.
+        bin_table = shard_bin_table(
+            num_full_layers=2,
+            num_state_layers=2,
+            ssm_heads_per_layer=2,
+            ssm_head_bytes=8 * 2,
+            conv_bytes_per_layer=2 * 4 * 2,
+            kv_cell_bytes_per_tok=32,
+            block_size=64,
+        )
         kwargs = dict(
-            size=32,
+            size=128,
             dtype=self.torch.bfloat16,
             head_num=1,
             head_dim=8,
@@ -334,13 +350,14 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             enable_memory_saver=False,
             max_batch_size=2,
             max_context_len=64,
-            page_size=4,
+            page_size=64,
             rank=0,
             layer_types=GDN_LAYER_TYPES,
             sliding_window_tokens=None,
             enable_alt_stream=False,
             conv_state_shape=(2, 4),
             temporal_state_shape=(2, 8),
+            state_bin_table=bin_table,
         )
         with mock.patch(_PKG_FLAT_PROBE, return_value=True):
             return self.MHATokenToKVPool(**kwargs)
@@ -363,11 +380,12 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         pool = self._state_pool()
         executor = self._executor(pool)
         mirror = executor.mirror
-        # Flat GDN KV (2 K + 2 V; state layers carry no KV, M18a T4) +
-        # conv0, ssm0, conv1, ssm1.
-        self.assertEqual(len(mirror.tensor_pairs), 8)
-        self._fill_spans(mirror, [3])
-        executor.submit_writeback([1], [[3]], [[0]])
+        # Flat GDN KV only: 2 K + 2 V mirrors (state layers carry no KV,
+        # M18a T4; their state bytes alias the full layers' slabs, M18c,
+        # so no state mirrors exist).
+        self.assertEqual(len(mirror.tensor_pairs), 4)
+        self._fill_spans(mirror, [1])
+        executor.submit_writeback([1], [[1]], [[0]])
         executor.flush()
         self._drain(executor, 1)
 
@@ -381,20 +399,20 @@ class FlatMemoryExecutorTest(unittest.TestCase):
             return events
 
         mirror.load_pages_with_events = spy
-        executor.submit_loadback([2], [[0]], [[3]])
+        executor.submit_loadback([2], [[0]], [[1]])
         executor.flush()
         events = captured["events"]
-        self.assertEqual(len(events), 8)
+        self.assertEqual(len(events), 4)
         producer_idx = executor.get_producer_index(self.CacheKind.KV, 2)
         producer_event = executor._counter.events[producer_idx]
-        # State layers 0/2 ack on their ssm event (conv precedes ssm on the
-        # serial stream, so it covers the pair); attention layer 1 keeps its
-        # V-tensor event (num_k=2, k-index 0 -> events[2]); the LAST layer
-        # pins events[-1] so finish_event (producer-slot reuse fence) covers
-        # the trailing state copies.
-        self.assertIs(producer_event.load_events[0], events[5])
+        # State layers 0/2 carry no KV mirror; their aliased state bytes may
+        # span several full-layer slabs, so they fence on the op's last
+        # per-tensor event (events[-1]). Attention layers keep their
+        # V-tensor event (num_k=2: layer 1 -> events[2], layer 3 ->
+        # events[3] == events[-1], which doubles as the finish-event pin).
+        self.assertIs(producer_event.load_events[0], events[-1])
         self.assertIs(producer_event.load_events[1], events[2])
-        self.assertIs(producer_event.load_events[2], events[7])
+        self.assertIs(producer_event.load_events[2], events[-1])
         self.assertIs(producer_event.load_events[3], events[-1])
         self.torch.cuda.synchronize()
         self.assertTrue(producer_event.finish_event.query())
@@ -410,7 +428,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
         self._fill_spans(mirror, device_pages)
         before = self._snapshot_spans(mirror, device_pages)
 
-        executor.submit_writeback([21], [[1, 2]], [[5, 6]])
+        executor.submit_writeback([21], [[1, 2]], [[3, 4]])
         executor.flush()
         self._drain(executor, 1)
 
@@ -419,7 +437,7 @@ class FlatMemoryExecutorTest(unittest.TestCase):
                 dev[d * span : (d + 1) * span].zero_()
         torch.cuda.synchronize()
 
-        executor.submit_loadback([23], [[5, 6]], [[1, 2]])
+        executor.submit_loadback([23], [[3, 4]], [[1, 2]])
         executor.flush()
         producer_idx = executor.get_producer_index(self.CacheKind.KV, 23)
         self.assertIsNotNone(producer_idx)
