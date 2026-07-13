@@ -22,6 +22,15 @@ from dataclasses import dataclass, replace
 # context), so a cross-module import would break either loader. Keep in sync.
 STATE_LAYER_TYPES = frozenset({"linear_attention"})
 
+# Shard-arena page blocks must be a multiple of this many tokens (the CUDA
+# kernel alignment quantum) so a state segment starts on an aligned slab row.
+_BLOCK_ALIGN = 64
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    """Integer ceil of numerator / denominator (both non-negative)."""
+    return -(-numerator // denominator)
+
 
 @dataclass(frozen=True)
 class ComponentSpec:
@@ -69,8 +78,8 @@ def state_const_bytes(conv_shape, conv_dtype, ssm_shape, ssm_dtype):
 
     Returns:
         dict[str, int]: {"conv": bytes, "ssm": bytes} — the exact
-        ``state_const_bytes`` mapping components_from_layers /
-        equalized_block_size consume (insertion order = row_offset order).
+        ``state_const_bytes`` mapping components_from_layers consumes
+        (insertion order = row_offset order).
     """
     return {
         "conv": math.prod(conv_shape) * conv_dtype.itemsize,
@@ -118,40 +127,74 @@ def solve_page_geometry(components, *, block_size, alignment):
     if max_const > 0:
         if max_linear == 0:
             raise ValueError("constant components need a linear row to size P against")
-        needed = -(-max_const // max_linear)  # exact integer ceil
+        needed = _ceil_div(max_const, max_linear)
         if needed > block_size:
             block_size = alignment * math.ceil(needed / alignment)
     block_bytes = max(max_linear * block_size, max_const)
     return BlockGeometry(block_size=block_size, block_bytes=block_bytes)
 
 
-def equalized_block_size(
-    *,
-    layer_types,
-    kv_bytes_per_slot,
-    state_const_bytes,
-    block_size,
-    alignment=None,
-):
-    """Effective P for a state-hybrid profile: `block_size` when the
-    widest KV row already covers the widest constant state row, else the
-    smallest multiple of `alignment` that does. `alignment` defaults to the
-    original `block_size` (the attention backend's page granularity —
-    no backend declares a finer one), so the inflated P stays a multiple of
-    the configured block size. Pure wrapper over components_from_layers +
-    solve_page_geometry so the config-level equalization decision and its
-    tests share one implementation."""
-    comps = components_from_layers(
-        layer_types=layer_types,
-        kv_bytes_per_slot=kv_bytes_per_slot,
-        state_const_bytes=state_const_bytes,
+@dataclass(frozen=True)
+class BaseBlockGeometry:
+    """Base-block sizing for the shared-arena state layout: one homogeneous
+    base block shared by KV and state, KV taking 1 block and one GDN linear
+    layer taking N blocks.
+
+    base_block_bytes: bytes of the single homogeneous base block.
+    blocks_per_state_layer: N, how many base blocks one linear layer's ssm state
+        occupies (base_block_bytes must divide the layer's ssm bytes).
+    kv_tokens_per_block: the KV block size P in tokens (base_block_bytes /
+        kv_bytes_per_token), i.e. the prefix-cache granularity the base block buys.
+    """
+
+    base_block_bytes: int
+    blocks_per_state_layer: int
+    kv_tokens_per_block: int
+
+
+def solve_base_block_geometry(
+    *, ssm_bytes_per_layer: int, kv_bytes_per_token: int, base_block_bytes: int
+) -> BaseBlockGeometry:
+    """Size the shared base block and derive N (blocks per state layer) and
+    the KV granularity it yields.
+
+    The base block must divide BOTH quantities so a state layer packs into a
+    whole number of blocks (no state padding) and a KV block is a whole number
+    of tokens (no KV padding) -- the "dual quantum coincidence" the scheme
+    relies on. For Qwen3.5 (ssm head cell 128*128*4 = 64KB) a 64KB base block
+    coincides across 35B/397B and every TP: 64KB divides both the per-layer ssm
+    bytes and the per-full-layer KV bytes/token.
+
+    Args:
+        ssm_bytes_per_layer: One linear layer's ssm state bytes (per TP shard).
+        kv_bytes_per_token: One full-attention layer's KV bytes per token
+            (per TP shard); the divisor turning block bytes into token count.
+        base_block_bytes: The candidate homogeneous base block size (bytes).
+
+    Returns:
+        BaseBlockGeometry with N and the KV token granularity.
+
+    Raises:
+        ValueError: base_block_bytes does not evenly divide ssm_bytes_per_layer
+            or kv_bytes_per_token (the coincidence fails; padding would result).
+    """
+    if base_block_bytes <= 0:
+        raise ValueError(f"base_block_bytes must be > 0, got {base_block_bytes}")
+    if ssm_bytes_per_layer % base_block_bytes != 0:
+        raise ValueError(
+            f"base_block_bytes {base_block_bytes} does not divide ssm bytes/layer "
+            f"{ssm_bytes_per_layer}: a state layer would need padding"
+        )
+    if base_block_bytes % kv_bytes_per_token != 0:
+        raise ValueError(
+            f"base_block_bytes {base_block_bytes} is not a whole number of KV "
+            f"tokens (kv_bytes_per_token {kv_bytes_per_token}): KV would pad"
+        )
+    return BaseBlockGeometry(
+        base_block_bytes=base_block_bytes,
+        blocks_per_state_layer=ssm_bytes_per_layer // base_block_bytes,
+        kv_tokens_per_block=base_block_bytes // kv_bytes_per_token,
     )
-    geo = solve_page_geometry(
-        comps,
-        block_size=block_size,
-        alignment=alignment if alignment is not None else block_size,
-    )
-    return geo.block_size
 
 
 @dataclass(frozen=True)
@@ -277,6 +320,124 @@ class StateShardBinTable:
     conv_entries: tuple[ShardBinEntry, ...]
 
 
+@dataclass(frozen=True)
+class FlatStateCapacity:
+    """Immutable capacity facts for request-owned Flat recurrent State pages.
+
+    ``physical_page_bytes`` is the memory-plan charge for one shared page id
+    across all backing tensors.  It is deliberately distinct from
+    ``logical_state_payload_bytes_per_checkpoint``, the recurrent payload
+    represented by one complete checkpoint across all State layers.
+    """
+
+    physical_page_bytes: int
+    logical_state_payload_bytes_per_checkpoint: int
+    usable_page_ids: int
+    state_shard_count: int
+    verify_width: int
+    canonical_pages_per_request: int
+    speculative_pages_per_request: int
+    total_state_pages_per_request: int
+    state_limited_request_concurrency: int
+
+
+def flat_state_capacity_from_plan(
+    plan: FlatMemoryPlan,
+    *,
+    state_bin_table: StateShardBinTable,
+    verify_width: int,
+    num_page_ids: int | None = None,
+) -> FlatStateCapacity:
+    """Calculate Flat recurrent-State capacity from the actual memory plan.
+
+    Args:
+        plan: Physical Flat allocation plan. ``geometry.block_bytes`` is the
+            shared-page-id byte charge across every backing tensor.
+        state_bin_table: State shard packing table; its ``num_shards`` is the
+            scheduler-visible fan-out ``k``.
+        verify_width: Number of target tokens in one verify call.
+        num_page_ids: Effective physical page-id count after any user/CI token
+            cap. Defaults to the plan's profiled count. Page id 0 is reserved.
+
+    Returns:
+        Immutable physical/logical sizing and request-concurrency facts.
+    """
+    if plan.geometry.block_size != state_bin_table.block_size:
+        raise ValueError(
+            "Flat plan and State bin table use different block sizes: "
+            f"{plan.geometry.block_size} vs {state_bin_table.block_size}"
+        )
+    if plan.geometry.block_bytes <= 0:
+        raise ValueError("Flat physical page bytes must be positive")
+    if verify_width < 1:
+        raise ValueError(f"verify_width must be positive, got {verify_width}")
+    if state_bin_table.num_shards < 1:
+        raise ValueError("State shard count must be positive")
+
+    page_ids = plan.geometry.num_blocks if num_page_ids is None else num_page_ids
+    if page_ids < 0:
+        raise ValueError(f"num_page_ids must be non-negative, got {page_ids}")
+    usable_page_ids = max(page_ids - 1, 0)
+    shard_count = state_bin_table.num_shards
+    canonical_pages = 2 * shard_count
+    speculative_pages = verify_width * shard_count if verify_width > 1 else 0
+    total_pages = canonical_pages + speculative_pages
+    logical_payload_bytes = sum(
+        entry.nbytes
+        for entry in state_bin_table.ssm_entries + state_bin_table.conv_entries
+    )
+    return FlatStateCapacity(
+        physical_page_bytes=plan.geometry.block_bytes,
+        logical_state_payload_bytes_per_checkpoint=logical_payload_bytes,
+        usable_page_ids=usable_page_ids,
+        state_shard_count=shard_count,
+        verify_width=verify_width,
+        canonical_pages_per_request=canonical_pages,
+        speculative_pages_per_request=speculative_pages,
+        total_state_pages_per_request=total_pages,
+        state_limited_request_concurrency=usable_page_ids // total_pages,
+    )
+
+
+def apply_flat_state_capacity_graph_gate(config, capacity: FlatStateCapacity | None):
+    """Apply only the Python CUDA-graph reachability gate.
+
+    The C++ scheduler's batch limit and page admission remain authoritative;
+    this function only prevents capture of batch buckets that State admission
+    can never reach.
+
+    Returns:
+        ``(old_max, effective_max)`` when an MTP State gate was evaluated,
+        otherwise ``None``.
+    """
+    if capacity is None or capacity.verify_width <= 1:
+        return None
+    concurrency = capacity.state_limited_request_concurrency
+    if concurrency < 1:
+        raise RuntimeError(
+            "Flat recurrent State capacity cannot represent one request: "
+            f"usable_page_ids={capacity.usable_page_ids}, "
+            f"state_shards={capacity.state_shard_count}, "
+            f"verify_width={capacity.verify_width}, "
+            f"pages_per_request={capacity.total_state_pages_per_request}"
+        )
+    previous = int(config.max_cudagraph_capture_size)
+    effective = min(previous, concurrency)
+    config.max_cudagraph_capture_size = effective
+    capture_sizes = getattr(config, "cudagraph_capture_sizes", None)
+    if (
+        capture_sizes is not None
+        and effective < previous
+        and effective > 0
+        and not any(0 < size <= effective for size in capture_sizes)
+    ):
+        # get_batch_sizes_to_capture filters explicit buckets by the effective
+        # max. Keep the user's list intact, but guarantee that filtering cannot
+        # produce an empty capture set (CudaGraphWrapper takes max() of it).
+        config.cudagraph_capture_sizes = [*capture_sizes, effective]
+    return previous, effective
+
+
 def shard_bin_table(
     *,
     num_full_layers,
@@ -309,8 +470,10 @@ def shard_bin_table(
         StateShardBinTable: num_shards (k), segment/head-group geometry, and
         the packed ssm/conv entries.
     """
-    if block_size % 64 != 0:
-        raise ValueError(f"block_size must be a multiple of 64, got {block_size}")
+    if block_size % _BLOCK_ALIGN != 0:
+        raise ValueError(
+            f"block_size must be a multiple of {_BLOCK_ALIGN}, got {block_size}"
+        )
     if num_full_layers < 1 or num_state_layers < 1:
         raise ValueError(
             "need at least one full layer and one state layer, got "
@@ -356,10 +519,127 @@ def shard_bin_table(
         off += conv_bytes_per_layer
     total_segs = seg + 1
     return StateShardBinTable(
-        num_shards=-(-total_segs // segs_per_shard),
+        num_shards=_ceil_div(total_segs, segs_per_shard),
         block_size=block_size,
         segment_bytes=segment_bytes,
         heads_per_group=heads_per_group,
         ssm_entries=tuple(ssm),
         conv_entries=tuple(conv),
     )
+
+
+@dataclass(frozen=True)
+class StateLayerHeadMap:
+    # Each field's length == that state layer's ssm head count (heads_per_layer).
+    #
+    # WARNING: (head_shard, head_elem_offset) is NOT an absolute address. The K
+    # and V segments of one state layer are packed into distinct slab rows that
+    # both start at byte_offset 0, so a K-side head and a V-side head can share
+    # the very same (shard, elem_offset) yet point at different memory. Resolve
+    # the base with the per-head ssm view's data_ptr() (which already encodes
+    # kv_side / slot / in-row byte offset); head_shard here only selects which
+    # runtime page-table row of state_pages to read, and head_elem_offset is for
+    # validation/asserts, not addressing.
+    head_shard: tuple[
+        int, ...
+    ]  # head h's page row = this row of state_pages (= entry.shard)
+    head_elem_offset: tuple[
+        int, ...
+    ]  # head h's element offset inside its shard's ssm view
+    #                                    (ssm dtype units, not bytes)
+
+
+def head_addressing_maps(bin_table, *, ssm_head_elems):
+    """Per-state-layer per-head (shard, in-view element offset), expanded from
+    the bin table's ssm entries. Each ssm entry covers a head group; head h in
+    a group at byte_offset b (ssm dtype itemsize s) sits at element offset
+    (b // s) + (h - head_begin) * ssm_head_elems within that shard's slab row.
+    Returns list indexed by state-layer occurrence order (len = num_state_layers).
+
+    WARNING: the returned (head_shard, head_elem_offset) pair is NOT an absolute
+    address. Because each state layer's K and V segments occupy separate slab
+    rows that both begin at byte_offset 0, a head on the K side and a head on the
+    V side can carry identical (shard, elem_offset) while aliasing distinct
+    memory. The consumer MUST take the base from each head's ssm view data_ptr()
+    (it already encodes kv_side / slot / segment offset); head_shard is only for
+    picking the state_pages runtime page-table row, and head_elem_offset is only
+    a validation/assert aid.
+
+    Args:
+        bin_table: StateShardBinTable.
+        ssm_head_elems: elements per ssm head cell (= prod(temporal_state_shape[1:]),
+            e.g. 128*128 = 16384). Element unit, matching the kernel's per-head
+            addressing (dtype-agnostic; itemsize handled by caller's byte_offset).
+    Returns:
+        list[StateLayerHeadMap]
+    """
+    by_layer: dict[int, list] = {}
+    order: list[int] = []
+    for e in bin_table.ssm_entries:
+        if e.state_layer not in by_layer:
+            by_layer[e.state_layer] = []
+            order.append(e.state_layer)
+        by_layer[e.state_layer].append(e)
+
+    # (layer, sorted entries, expanded lists, tail head count) per state layer.
+    expanded: list[tuple[int, int, list[int], list[int]]] = []
+    for layer in order:
+        head_shard: list[int] = []
+        head_elem_offset: list[int] = []
+        heads_covered = 0
+        for e in sorted(by_layer[layer], key=lambda entry: entry.head_begin):
+            if e.head_begin != heads_covered:
+                raise ValueError(
+                    f"state layer {layer}: ssm head groups do not tile [0, N) "
+                    f"contiguously; expected head_begin {heads_covered}, got "
+                    f"{e.head_begin}"
+                )
+            if e.num_heads < 1:
+                raise ValueError(
+                    f"state layer {layer}: ssm entry has num_heads {e.num_heads}"
+                )
+            # byte_offset is bytes; recover ssm dtype itemsize from this entry so
+            # the pure function need not know the dtype: one head is nbytes//num_heads
+            # bytes = itemsize * ssm_head_elems elements.
+            if e.nbytes % e.num_heads != 0:
+                raise ValueError(
+                    f"state layer {layer}: entry nbytes {e.nbytes} is not divisible "
+                    f"by num_heads {e.num_heads}"
+                )
+            head_bytes = e.nbytes // e.num_heads
+            itemsize = head_bytes // ssm_head_elems
+            if itemsize < 1 or itemsize * ssm_head_elems != head_bytes:
+                raise ValueError(
+                    f"state layer {layer}: head bytes {head_bytes} is not a whole "
+                    f"multiple of ssm_head_elems {ssm_head_elems}"
+                )
+            elem_base = e.byte_offset // itemsize
+            for h in range(e.num_heads):
+                head_shard.append(e.shard)
+                head_elem_offset.append(elem_base + h * ssm_head_elems)
+            heads_covered += e.num_heads
+        # heads_covered == last group's (head_begin + num_heads): head order tiles
+        # [0, heads_covered). The prefix check above already forbids interior gaps,
+        # so the only remaining failure is a dropped *tail* group -> a short map.
+        expanded.append((layer, heads_covered, head_shard, head_elem_offset))
+
+    # Tail-coverage: every state layer of a model carries the same ssm head
+    # count, so the expected upper bound is the largest per-layer head total.
+    # A layer whose last group was dropped tiles [0, short) cleanly yet expands
+    # to fewer heads than its peers -> caught here (never silently truncated).
+    expected_heads = max(total for _, total, _, _ in expanded)
+    maps: list[StateLayerHeadMap] = []
+    for layer, total, head_shard, head_elem_offset in expanded:
+        if total != expected_heads:
+            raise ValueError(
+                f"state layer {layer}: ssm head groups cover only heads "
+                f"[0, {total}) but layers reach [0, {expected_heads}); a tail "
+                f"head group is missing"
+            )
+        maps.append(
+            StateLayerHeadMap(
+                head_shard=tuple(head_shard),
+                head_elem_offset=tuple(head_elem_offset),
+            )
+        )
+    return maps

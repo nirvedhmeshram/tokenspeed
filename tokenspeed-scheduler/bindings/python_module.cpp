@@ -366,6 +366,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return op.flat_block_tables;
             },
             nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "flat_state_in_pages",
+            [](const tokenspeed::FlatForwardOperation& op)
+                -> const std::map<std::string, std::vector<std::int32_t>>& { return op.flat_state_in_pages; },
+            nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "flat_state_out_pages",
+            [](const tokenspeed::FlatForwardOperation& op)
+                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& {
+                return op.flat_state_out_pages;
+            },
+            nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "flat_state_spec_pages",
+            [](const tokenspeed::FlatForwardOperation& op)
+                -> const std::map<std::string, std::vector<std::vector<std::int32_t>>>& {
+                return op.flat_state_spec_pages;
+            },
+            nb::rv_policy::reference_internal)
         .def("num_extends", &tokenspeed::FlatForwardOperation::num_extends)
         .def_ro("mamba_pool_indices", &tokenspeed::FlatForwardOperation::mamba_working_indices)
         .def_ro("mamba_checkpoint_dst_indices", &tokenspeed::FlatForwardOperation::mamba_checkpoint_dst_indices)

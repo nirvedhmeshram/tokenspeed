@@ -332,3 +332,126 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
 
     assert result.out.shape == v.shape
     assert result.final_state.shape == initial_state.shape
+
+
+def _varlen_inputs(device: str, seq_lens: list[int]):
+    torch.manual_seed(0)
+    total = sum(seq_lens)
+    num_heads, head_dim = 4, 16
+    q = torch.randn(total, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    beta = torch.rand(total, num_heads, device=device, dtype=torch.bfloat16)
+    g = F.logsigmoid(torch.rand(total, num_heads, device=device, dtype=torch.float32))
+    initial_state = torch.randn(
+        len(seq_lens),
+        num_heads,
+        head_dim,
+        head_dim,
+        device=device,
+        dtype=torch.float32,
+    )
+    cu = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
+    return q, k, v, g, beta, initial_state, cu
+
+
+@pytest.mark.parametrize("interval", [None, 128])
+def test_flashinfer_gdn_checkpoint_interval_reaches_kernel(
+    device: str, require, monkeypatch, interval: int | None
+):
+    # The wrapper must size the checkpoint buffer by L // interval and hand
+    # the interval through as checkpoint_every_n_tokens (None keeps the
+    # historical 64-token grid byte-for-byte).
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as fi_mod
+
+    seq_lens = [130, 257]
+    q, k, v, g, beta, initial_state, cu = _varlen_inputs(device, seq_lens)
+    seen: dict[str, object] = {}
+
+    def fake_kernel(q3, k3, v3, **kwargs):
+        seen.update(kwargs)
+        out = torch.zeros_like(v3)
+        return out, kwargs["initial_state"].clone()
+
+    monkeypatch.setattr(fi_mod, "_chunk_gated_delta_rule", fake_kernel)
+    result = fi_mod.gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=None,
+        initial_state=initial_state,
+        cu_seqlens=cu,
+        output_final_state=True,
+        output_h=True,
+        checkpoint_interval=interval,
+    )
+    effective = fi_mod.CHUNK_SIZE if interval is None else interval
+    expected_counts = [n // effective for n in seq_lens]
+    assert seen["checkpoint_every_n_tokens"] == effective
+    assert seen["state_checkpoints"].shape[0] == sum(expected_counts)
+    assert result.h_cu_starts.tolist() == [
+        0,
+        expected_counts[0],
+        expected_counts[0] + expected_counts[1],
+    ]
+    assert result.h_layout is GdnCheckpointLayout.FLASHINFER
+
+
+def test_flashinfer_gdn_checkpoint_interval_must_align(device: str, require):
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.flashinfer import gated_delta_rule as fi_mod
+
+    q, k, v, g, beta, initial_state, cu = _varlen_inputs(device, [130])
+    for bad in (96, 0, -64):
+        with pytest.raises(ValueError, match="checkpoint_interval"):
+            fi_mod.gdn_chunk_prefill(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale=None,
+                initial_state=initial_state,
+                cu_seqlens=cu,
+                output_h=True,
+                checkpoint_interval=bad,
+            )
+
+
+def test_triton_gdn_checkpoint_interval_is_accepted_and_ignored(
+    device: str, require, monkeypatch
+):
+    # The FLA h workspace is fixed to the 64-token grid; the parameter must
+    # be accepted (shared wrapper signature) but never forwarded.
+    require("attention", "gdn_chunk_prefill", "triton", torch.bfloat16, "q")
+    from tokenspeed_kernel.ops.attention.triton import gated_delta_rule as tr_mod
+
+    seen: dict[str, object] = {}
+
+    def fake_chunk(**kwargs):
+        seen.update(kwargs)
+        return torch.zeros(1), torch.zeros(1), torch.zeros(1)
+
+    monkeypatch.setattr(tr_mod, "chunk_gated_delta_rule", fake_chunk)
+    q, k, v, g, beta, initial_state, cu = _varlen_inputs(device, [130])
+    result = tr_mod.triton_gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=None,
+        initial_state=initial_state,
+        cu_seqlens=cu,
+        output_h=True,
+        checkpoint_interval=128,
+    )
+    assert "checkpoint_interval" not in seen
+    assert result.h_layout is GdnCheckpointLayout.FLA

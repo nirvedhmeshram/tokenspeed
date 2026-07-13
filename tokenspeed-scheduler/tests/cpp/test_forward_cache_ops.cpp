@@ -102,7 +102,7 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
         coordinator.ClaimCommonPrefix(probe, hit);
         EXPECT_EQ(probe[0].TailAvailableTokens(), 0);
         EXPECT_EQ(probe[1].TailAvailableTokens(), 0);
-        EXPECT_EQ(coordinator.BlocksNeededFor(probe, /*num_tokens=*/4), 4);
+        EXPECT_EQ(coordinator.BlocksNeededFor(probe, /*num_tokens=*/4, /*decode_width=*/0), 4);
         FreeRequest(coordinator, probe);
     }
 
@@ -197,7 +197,7 @@ TEST(ForwardCacheOpsPrefill, FinalizeSlidesSwaWindowBeforeReserveAcquire) {
         hashes[i] = std::string(64, static_cast<char>('a' + i));
     }
     ASSERT_TRUE(FinalizePrefillAndReserveDecode(coordinator, tables, hashes, /*reserve_tokens=*/1,
-                                                /*num_computed_tokens=*/12));
+                                                /*registration_end_tokens=*/12));
 
     ASSERT_EQ(tables[1].NumBlocks(), 7);
     for (std::int32_t i = 0; i < 4; ++i) {

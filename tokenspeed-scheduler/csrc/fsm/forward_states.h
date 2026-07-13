@@ -147,6 +147,9 @@ public:
     std::vector<BlockTable>& BlockTables() { return block_tables_; }
     const std::vector<BlockTable>& BlockTables() const { return block_tables_; }
     std::vector<BlockTable> TakeBlockTables() && { return std::move(block_tables_); }
+    // TODO(radix-removal): this setter only exists because the ctor still carries radix's node_ref /
+    // kv_allocator params, forcing the flat path to construct with nullptr placeholders then patch
+    // block_tables in. When radix goes, reshape the ctor to take block_tables directly and drop this.
     void SetBlockTables(std::vector<BlockTable> tables) { block_tables_ = std::move(tables); }
 
 protected:
@@ -309,6 +312,8 @@ struct Decoding : public ForwardState {
 
 #if TOKENSPEED_FLAT_KVCACHE
     HashChain TakeHashChain() && { return std::move(hash_chain_); }
+    // TODO(radix-removal): fold hash_chain into the ctor alongside block_tables and drop this setter
+    // (see SetBlockTables) -- hash_chain is a plain computed value with no post-construction mutation.
     void SetHashChain(HashChain chain) { hash_chain_ = std::move(chain); }
 #endif
 

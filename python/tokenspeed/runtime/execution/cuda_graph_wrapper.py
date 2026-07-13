@@ -971,6 +971,8 @@ class CudaGraphWrapper:
         mamba_cow_src_indices: torch.Tensor | None = None,
         mamba_branching_seqlens: torch.Tensor | None = None,
         mamba_track_pool_indices: torch.Tensor | None = None,
+        flat_state_pages: torch.Tensor | None = None,
+        flat_state_spec_pages: torch.Tensor | None = None,
         spec_info=None,
         paged_cache_block_tables: dict | None = None,
         paged_cache_block_table_base_offsets: dict | None = None,
@@ -1033,6 +1035,13 @@ class CudaGraphWrapper:
             mamba_kwargs["mamba_branching_seqlens"] = mamba_branching_seqlens
         if mamba_track_pool_indices is not None:
             mamba_kwargs["mamba_track_pool_indices"] = mamba_track_pool_indices
+        if flat_state_pages is not None:
+            mamba_kwargs["flat_state_pages"] = flat_state_pages
+        if flat_state_spec_pages is not None:
+            # Request-owned speculative checkpoints. The backend resolves its
+            # input and canonical commit destinations from GPU sequence lengths
+            # and the complete Flat block table.
+            mamba_kwargs["flat_state_spec_pages"] = flat_state_spec_pages
 
         if use_graph:
             if (

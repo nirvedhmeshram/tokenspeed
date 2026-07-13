@@ -74,6 +74,16 @@ Scheduler::Scheduler(SchedulerConfig config)
               ids.push_back(g.group_id);
           }
           return ids;
+      }()},
+      flat_state_group_block_sizes_{[&] {
+          std::map<std::string, std::int32_t> groups;
+          for (const auto& g : config_.paged_cache_groups) {
+              if (g.family == PagedCacheGroupFamily::State &&
+                  g.retention != PagedCacheGroupConfig::Retention::SlidingWindow) {
+                  groups.emplace(g.group_id, g.block_size > 0 ? g.block_size : config_.block_size);
+              }
+          }
+          return groups;
       }()}
 #endif
 {
@@ -86,6 +96,14 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.overlap_schedule_depth > 0 && config_.decode_input_tokens == 0) {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
+#if TOKENSPEED_FLAT_KVCACHE
+    if (coordinator_.RequiresAlignedPrefillChunks() &&
+        config_.max_scheduled_tokens < coordinator_.LcmBlockSize()) {
+        throw std::invalid_argument(
+            "Scheduler: max_scheduled_tokens must be >= the Flat cache-group LCM when an "
+            "aligned recurrent State group is configured");
+    }
+#endif
     if (auto* env = std::getenv("SPDLOG_LEVEL")) {
         std::string level_str{env};
         spdlog::level::level_enum level = spdlog::level::from_str(level_str);

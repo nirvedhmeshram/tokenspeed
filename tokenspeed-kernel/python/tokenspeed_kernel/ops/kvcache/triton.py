@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -38,6 +39,7 @@ _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32
 _is_nvidia = current_platform().is_nvidia
 
 __all__ = [
+    "flat_mtp_state_commit",
     "fused_fp8_set_kv_buffer",
     "gather_page_table_with_padding",
     "store_kv_cache",
@@ -46,6 +48,172 @@ __all__ = [
     "transfer_kv_per_layer",
     "transfer_kv_per_layer_mla",
 ]
+
+
+# -----------------------------------------------------------------------------
+# Flat MTP State Commit
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _flat_mtp_state_commit_kernel(
+    state_ptr,
+    spec_pages_ptr,
+    out_pages_ptr,
+    accepted_lengths_ptr,
+    state_row_stride,
+    spec_request_stride,
+    spec_step_stride,
+    out_request_stride,
+    out_step_stride,
+    num_state_rows,
+    verify_width: tl.constexpr,
+    row_elements: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    request_step = tl.program_id(0)
+    request = request_step // verify_width
+    step = request_step - request * verify_width
+
+    accepted = tl.load(accepted_lengths_ptr + request).to(tl.int32)
+    src_page = tl.load(
+        spec_pages_ptr + request * spec_request_stride + step * spec_step_stride
+    ).to(tl.int64)
+    dst_page = tl.load(
+        out_pages_ptr + request * out_request_stride + step * out_step_stride
+    ).to(tl.int64)
+    has_next = step + 1 < verify_width
+    next_dst_page = tl.load(
+        out_pages_ptr + request * out_request_stride + (step + 1) * out_step_stride,
+        mask=has_next,
+        other=dst_page,
+    ).to(tl.int64)
+
+    selected = (step < accepted) & (
+        (step == accepted - 1) | (dst_page != next_dst_page)
+    )
+    valid_pages = (
+        (src_page >= 0)
+        & (src_page < num_state_rows)
+        & (dst_page >= 0)
+        & (dst_page < num_state_rows)
+    )
+    if not (selected & valid_pages):
+        return
+
+    src = state_ptr + src_page * state_row_stride
+    dst = state_ptr + dst_page * state_row_stride
+    for start in tl.static_range(0, row_elements, BLOCK_SIZE):
+        offsets = start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < row_elements
+        values = tl.load(src + offsets, mask=mask)
+        tl.store(dst + offsets, values, mask=mask)
+
+
+def flat_mtp_state_commit(
+    state: torch.Tensor,
+    spec_pages: torch.Tensor,
+    out_pages: torch.Tensor,
+    accepted_lengths: torch.Tensor,
+    *,
+    validate_accepted_lengths: bool = True,
+) -> None:
+    """Commit accepted recurrent checkpoints into canonical State pages.
+
+    The selection predicate is evaluated on device for every request and
+    verify step. No host synchronization or dynamic boolean compression is
+    used. The launch is enqueued on PyTorch's current CUDA stream.
+
+    Args:
+        state: State-page view shaped ``[num_pages, ...]``. Rows may have a
+            padded stride, while elements within each row must be contiguous.
+        spec_pages: Speculative source ids shaped ``[batch, verify_width]``.
+        out_pages: Canonical destination ids with the same shape as
+            ``spec_pages``; adjacent ids may repeat.
+        accepted_lengths: Accepted widths shaped ``[batch]``.
+        validate_accepted_lengths: Schedule one device-side accepted-range
+            assertion. Callers issuing several State-component copies for the
+            same metadata may validate once and pass ``False`` afterward.
+
+    Returns:
+        None. Selected rows are copied in place within ``state``.
+    """
+    if not accepted_lengths.is_contiguous():
+        raise ValueError("accepted_lengths must be contiguous")
+    if not state.is_cuda:
+        raise ValueError("Flat MTP State commit requires a CUDA state tensor")
+    if state.ndim < 2 or state.shape[0] == 0:
+        raise ValueError(
+            f"state must have shape [num_pages, ...], got {tuple(state.shape)}"
+        )
+    if spec_pages.ndim != 2 or out_pages.ndim != 2:
+        raise ValueError("spec_pages and out_pages must have shape [batch, N]")
+    if spec_pages.shape != out_pages.shape:
+        raise ValueError(
+            "spec_pages and out_pages shapes differ: "
+            f"{tuple(spec_pages.shape)} vs {tuple(out_pages.shape)}"
+        )
+    if accepted_lengths.ndim != 1 or accepted_lengths.shape[0] != spec_pages.shape[0]:
+        raise ValueError(
+            "accepted_lengths must have shape [batch] matching page metadata"
+        )
+    verify_width = spec_pages.shape[1]
+    if verify_width < 1:
+        raise ValueError("verify width must be positive")
+    if spec_pages.stride(1) != 1 or out_pages.stride(1) != 1:
+        raise ValueError("page metadata rows must be inner-contiguous")
+    if (spec_pages.shape[0] > 1 and spec_pages.stride(0) < verify_width) or (
+        out_pages.shape[0] > 1 and out_pages.stride(0) < verify_width
+    ):
+        raise ValueError("page metadata request rows must not overlap")
+    if any(
+        tensor.device != state.device
+        for tensor in (spec_pages, out_pages, accepted_lengths)
+    ):
+        raise ValueError(
+            "state, page metadata, and accepted lengths must share a device"
+        )
+    integer_dtypes = (torch.int32, torch.int64)
+    if spec_pages.dtype not in integer_dtypes or out_pages.dtype not in integer_dtypes:
+        raise ValueError("page metadata must use int32 or int64")
+    if accepted_lengths.dtype not in integer_dtypes:
+        raise ValueError("accepted_lengths must use int32 or int64")
+
+    expected_stride = 1
+    for size, stride in zip(reversed(state.shape[1:]), reversed(state.stride()[1:])):
+        if size > 1 and stride != expected_stride:
+            raise ValueError("state page rows must be inner-contiguous")
+        expected_stride *= size
+    row_elements = math.prod(state.shape[1:])
+    if row_elements < 1:
+        raise ValueError("state page rows must be non-empty")
+    if state.shape[0] > 1 and state.stride(0) < row_elements:
+        raise ValueError("state page rows must not overlap")
+
+    request_count = accepted_lengths.shape[0]
+    if request_count == 0:
+        return
+    if validate_accepted_lengths:
+        torch._assert_async(
+            ((accepted_lengths >= 1) & (accepted_lengths <= verify_width)).all(),
+            f"accepted_lengths must be in [1, {verify_width}]",
+        )
+    _flat_mtp_state_commit_kernel[(request_count * verify_width,)](
+        state,
+        spec_pages,
+        out_pages,
+        accepted_lengths,
+        state.stride(0),
+        spec_pages.stride(0),
+        spec_pages.stride(1),
+        out_pages.stride(0),
+        out_pages.stride(1),
+        state.shape[0],
+        verify_width=verify_width,
+        row_elements=row_elements,
+        BLOCK_SIZE=8192,
+        num_warps=8,
+    )
 
 
 # -----------------------------------------------------------------------------

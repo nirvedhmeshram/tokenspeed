@@ -61,6 +61,17 @@ _KERNEL_SOLUTION_BY_BACKEND = {
     "flashinfer": "flashinfer",
 }
 
+# Current SM100 FlashInfer builds may route the generic ``flashinfer``
+# selection to TRTLLM kernels, which only ship a P=64 specialization.
+FLASHINFER_KERNEL_PAGE_SIZE = 64
+
+
+def _real_extend_tokens(metadata) -> int:
+    """Real (unpadded) token count of an extend forward, from the pinned CPU
+    cu-seqlens mirror (sync-free). Under a prefill graph the k/v/loc tensors
+    may be padded to a bucket length past this."""
+    return int(metadata.cu_extend_seq_lens_cpu[-1])
+
 
 def _scrub_extend_padding(metadata, q, k, v) -> None:
     """Zero the q/k/v rows beyond the real (unpadded) token count under a prefill graph.
@@ -68,7 +79,7 @@ def _scrub_extend_padding(metadata, q, k, v) -> None:
     Reads the count from the pinned CPU cu-seqlens mirror (sync-free) and delegates the
     zeroing to the shared prefill-graph padding helper. No-op on normal unpadded forwards.
     """
-    scrub_padding_tail(metadata.cu_extend_seq_lens_cpu[-1], q, k, v)
+    scrub_padding_tail(_real_extend_tokens(metadata), q, k, v)
 
 
 @dataclass(kw_only=True)
@@ -122,6 +133,17 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> bool:
         return forward_mode is not None and forward_mode.is_decode()
 
+    @property
+    def _verify_tokens_per_req(self) -> int:
+        """Decode rows per request: spec_num_tokens under target-verify
+        speculative decoding (whole draft block in one forward), else 1.
+        Drafts stay at 1 (they emit one token per step)."""
+        return (
+            self.spec_num_tokens
+            if self.spec_num_tokens > 1 and not self.is_draft
+            else 1
+        )
+
     def __init__(self, config: MHAConfig):
         super().__init__(config)
         # Map the selected backend to the corresponding kernel solution string.
@@ -132,6 +154,12 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.max_context_len = config.context_len
         self.page_size = config.page_size
         self.max_num_pages = ceil_div(self.max_context_len, self.page_size)
+        self.kernel_page_ratio = (
+            self.page_size // FLASHINFER_KERNEL_PAGE_SIZE
+            if self.kernel_solution in (None, "flashinfer")
+            and self.page_size % FLASHINFER_KERNEL_PAGE_SIZE == 0
+            else 1
+        )
         num_q_heads = config.num_attention_heads
         num_kv_heads = config.num_kv_heads
         self.tp_q_head_num = max(num_q_heads // config.attn_tp_size, 1)
@@ -204,16 +232,11 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                     self.page_size,
                 )
             else:
-                verify_tokens = (
-                    self.spec_num_tokens
-                    if self.spec_num_tokens > 1 and not self.is_draft
-                    else 1
-                )
                 flat_out_cache_locs = self._compute_flat_decode_out_cache_locs(
                     flat_page_tables,
                     seq_lens,
                     self.page_size,
-                    verify_tokens,
+                    self._verify_tokens_per_req,
                 )
             self._maybe_check_flat_write_locs(
                 flat_page_tables, flat_out_cache_locs, self.page_size
@@ -349,7 +372,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         self.cuda_graph_page_table = torch.zeros(
             (max_bs, self.max_num_pages), dtype=torch.int32, device=self.device
         )
-        if self.spec_num_tokens > 1 and not self.is_draft:
+        if self._verify_tokens_per_req > 1:
             self.cuda_graph_seq_lens = torch.empty(
                 (max_bs,), dtype=torch.int32, device=self.device
             )
@@ -379,11 +402,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         page_tables, out_cache_locs = self._flat_capture_group_views(
             bs,
             flat_cache_group_ids,
-            tokens_per_req=(
-                self.spec_num_tokens
-                if self.spec_num_tokens > 1 and not self.is_draft
-                else 1
-            ),
+            tokens_per_req=self._verify_tokens_per_req,
         )
 
         if self.draft_block_decode and self.spec_num_tokens > 1:
@@ -414,7 +433,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 page_tables=page_tables,
                 out_cache_locs=out_cache_locs,
             )
-            if self.spec_num_tokens > 1 and not self.is_draft:
+            if self._verify_tokens_per_req > 1:
                 metadata.seq_lens.copy_(seq_lens[:bs].clamp_min(self.spec_num_tokens))
         self.cuda_graph_decode_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
@@ -447,7 +466,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 page_size=self.page_size,
                 dummy_slot=0,
             )
-        if self.spec_num_tokens > 1 and not self.is_draft:
+        if self._verify_tokens_per_req > 1:
             self.cuda_graph_seq_lens[:bs].copy_(seq_lens[:bs])
         elif self.draft_block_decode:
             # DFLASH draft: replicate each request's page table to its
@@ -465,11 +484,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
                 bs,
                 flat_block_tables,
                 self.cuda_graph_seq_lens,
-                tokens_per_req=(
-                    self.spec_num_tokens
-                    if self.spec_num_tokens > 1 and not self.is_draft
-                    else 1
-                ),
+                tokens_per_req=self._verify_tokens_per_req,
             )
 
         if bs in self.cuda_graph_decode_metadata:
@@ -645,7 +660,16 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     ) -> torch.Tensor:
         _scrub_extend_padding(metadata, q, k, v)
         if save_kv_cache:
-            self._save_kv_cache(layer, out_cache_loc, token_to_kv_pool, k, v)
+            # A prefill-graph break hands bucket-length k/v but real-length
+            # out_cache_loc; store_kv_cache scatters k.shape[0] rows and reads
+            # loc[row] for each, so a padded k over a shorter loc reads OOB (IMA
+            # on flat KV). The padded tail is already zeroed above and holds no
+            # real KV, so clamp to the real token count. Unpadded extend: no-op.
+            real = _real_extend_tokens(metadata)
+            k_save = k[:real]
+            v_save = v[:real] if v is not None else None
+            loc_save = out_cache_loc[:real]
+            self._save_kv_cache(layer, loc_save, token_to_kv_pool, k_save, v_save)
 
         if self.is_fp8:
             q = q.to(self.kv_cache_dtype)
@@ -657,7 +681,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             cu_seqlens_kv=metadata.cu_seqlens_kv,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=self._select_page_table(layer, metadata),
+            page_table=self._select_kernel_page_table(layer, metadata),
             cache_seqlens=metadata.seq_lens,
             max_seqlen_q=metadata.max_extend_seq_len,
             max_seqlen_k=self.max_context_len,
@@ -696,7 +720,7 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=self._select_page_table(layer, metadata),
+            page_table=self._select_kernel_page_table(layer, metadata),
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,
@@ -750,17 +774,42 @@ class MHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1,
-            self.page_size,
+            (
+                FLASHINFER_KERNEL_PAGE_SIZE
+                if self.kernel_page_ratio > 1
+                else self.page_size
+            ),
             layer.tp_k_head_num,
             layer.qk_head_dim,
         )
         v_cache = token_to_kv_pool.get_value_buffer(layer.layer_id).view(
             -1,
-            self.page_size,
+            (
+                FLASHINFER_KERNEL_PAGE_SIZE
+                if self.kernel_page_ratio > 1
+                else self.page_size
+            ),
             layer.tp_v_head_num,
             layer.v_head_dim,
         )
         return k_cache, v_cache
+
+    def _kernel_page_table(self, page_table: torch.Tensor) -> torch.Tensor:
+        if self.kernel_page_ratio == 1:
+            return page_table
+        valid = page_table > 0
+        base = torch.where(
+            valid, page_table * self.kernel_page_ratio, page_table.new_zeros(())
+        )
+        offsets = torch.arange(
+            self.kernel_page_ratio, dtype=page_table.dtype, device=page_table.device
+        )
+        logical = base.unsqueeze(-1) + offsets
+        logical = torch.where(valid.unsqueeze(-1), logical, page_table.new_zeros(()))
+        return logical.reshape(page_table.shape[0], -1)
+
+    def _select_kernel_page_table(self, layer, metadata):
+        return self._kernel_page_table(self._select_page_table(layer, metadata))
 
     def _make_spec_metadata_buffers(
         self,

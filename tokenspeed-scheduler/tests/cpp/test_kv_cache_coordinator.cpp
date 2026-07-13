@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <concepts>
 #include <cstdint>
 #include <memory>
 #include <set>
@@ -33,6 +34,7 @@
 #include "cache/kv_cache_coordinator.h"
 #include "cache/cache_types.h"
 #include "cache/full_attn_manager.h"
+#include "cache/mamba_state_manager.h"
 #include "cache/swa_manager.h"
 #include "scheduler/page_hasher.h"
 
@@ -70,6 +72,13 @@ void ExpectSwaWindowIntact(const PrefixMatch& m, std::int32_t window, std::int32
     }
 }
 
+class RegistrationOnlyManager final : public FullAttnManager {
+public:
+    using FullAttnManager::FullAttnManager;
+
+    bool CachesAlignedStateSnapshots() const override { return true; }
+};
+
 TEST(CacheGroupTest, HoldsSpecGroupIdManager) {
     BlockPool pool(8);
     auto mgr = std::make_unique<FullAttnManager>(4);
@@ -92,11 +101,39 @@ TEST(MakeCoordinatorTest, BuildsOneGroupPerSpec) {
 TEST(MakeCoordinatorTest, AcceptsDivisibleBlockSizesAndFoldsGcdLcm) {
     BlockPool pool(16);
     std::vector<KvCacheSpec> specs = {
-        {AttnKind::kFull, 4, 0}, {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kSlidingWindow, 8, 10},  // per-group block_size (multiple of base)
     };
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
     EXPECT_EQ(coord.BaseBlockSize(), 4);  // gcd(4,8)
     EXPECT_EQ(coord.LcmBlockSize(), 8);   // lcm(4,8)
+}
+
+TEST(KvCacheCoordinatorPolicyTest, SnapshotRegistrationDoesNotRequireAlignedPrefillChunks) {
+    BlockPool pool(16);
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(KvCacheSpec{AttnKind::kFull, 4, 0}, /*group_id=*/0,
+                        std::make_unique<RegistrationOnlyManager>(/*block_size=*/4));
+
+    KvCacheCoordinator coordinator(std::move(groups), pool, /*host_pool=*/nullptr,
+                                   /*base_block_size=*/4, /*lcm_block_size=*/4);
+
+    EXPECT_FALSE(coordinator.RequiresAlignedPrefillChunks());
+}
+
+TEST(KvCacheManagerPolicyTest, SafeReclaimBoundaryIsManagerSpecific) {
+    FullAttnManager full(/*block_size=*/4);
+    MambaStateManager state(/*block_size=*/4);
+
+    EXPECT_EQ(full.SafeReclaimBoundary(/*execution_end_tokens=*/12,
+                                       /*protected_input_tokens=*/1),
+              12);
+    EXPECT_EQ(state.SafeReclaimBoundary(/*execution_end_tokens=*/12,
+                                        /*protected_input_tokens=*/1),
+              11);
+    EXPECT_EQ(state.SafeReclaimBoundary(/*execution_end_tokens=*/12,
+                                        /*protected_input_tokens=*/0),
+              12);
 }
 
 TEST(CoordinatorMatchTest, BothGroupsAllMiss) {
@@ -304,7 +341,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(coord.Acquire(tables, 24));                 // 6 pages each
     coord.CacheFullBlocks(tables, std::span(ch).first(4));  // prefill path: slots 0..3
-    coord.CacheFullBlocks(tables, std::span(ch).subspan(4), /*first_slot=*/4);
+    coord.CacheFullBlocks(tables, std::span(ch).subspan(4), /*first_base_block=*/4);
 
     CoordinatorMatch m = coord.MatchPrefix(ch).device;
     EXPECT_EQ(m.num_common_tokens, 24);
@@ -335,7 +372,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
     ASSERT_TRUE(tables[1].Blocks()[3]->IsNull());
     ASSERT_FALSE(tables[1].Blocks()[4]->IsNull());
 
-    coord.CacheFullBlocks(tables, std::span(ch).subspan(2), /*first_slot=*/2);
+    coord.CacheFullBlocks(tables, std::span(ch).subspan(2), /*first_base_block=*/2);
     for (std::size_t s = 2; s < 6; ++s) {
         EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[s], 0)), nullptr) << "full slot " << s;
     }
@@ -353,8 +390,8 @@ TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
     std::vector<std::string> ch = ContentHashes({{7, 7, 7, 7}});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(coord.Acquire(tables, 8));  // 2 pages each
-    EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_slot=*/2), std::runtime_error);
-    EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_slot=*/-1), std::runtime_error);
+    EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_base_block=*/2), std::runtime_error);
+    EXPECT_THROW(coord.CacheFullBlocks(tables, ch, /*first_base_block=*/-1), std::runtime_error);
 }
 
 TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
@@ -831,7 +868,7 @@ TEST(KvCacheCoordinatorStoreCandidates, CollectsPinnedNewRegistrations) {
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
     const std::int32_t free_before = pool.NumFreeBlocks();
 
-    coordinator.CacheFullBlocks(tables, hashes, /*first_slot=*/0);
+    coordinator.CacheFullBlocks(tables, hashes, /*first_base_block=*/0);
     std::vector<KvCacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
 
     ASSERT_EQ(pending.size(), 4u);  // 2 pages x 2 groups, group-wrapped keys
@@ -1300,35 +1337,164 @@ TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
     coord.Free(tables);
 }
 
-// State snapshots are only boundary-correct where a forward call ended page-aligned: the
-// coordinator narrows a state group's registration to the final full page of an aligned range.
-TEST(MambaStateRegistrationTest, AlignedEndRegistersOnlyFinalPage) {
+template <typename Manager>
+concept SupportsSpeculativeStateBlocks = requires(Manager& manager, BlockPool& pool, BlockTable& table) {
+    { manager.SpeculativeBlocksNeededFor(table, 1) } -> std::same_as<std::int32_t>;
+    { manager.AcquireSpeculativeBlocks(pool, table, 1) } -> std::same_as<bool>;
+};
+
+// The speculative-state API is a uniform manager interface: non-state managers inherit the
+// base no-op (0 needed / true), so the coordinator can drive every group without a downcast.
+static_assert(SupportsSpeculativeStateBlocks<MambaStateManager>);
+static_assert(SupportsSpeculativeStateBlocks<FullAttnManager>);
+static_assert(SupportsSpeculativeStateBlocks<SwaManager>);
+
+TEST(SpeculativeBlocksBaseDefaultTest, NonStateManagersNeedNoneAndAcquireIsNoOp) {
+    BlockPool pool(16);
+    FullAttnManager full(/*block_size=*/4);
+    SwaManager swa(/*block_size=*/4, /*sliding_window=*/2);
+    BlockTable full_table;
+    BlockTable swa_table;
+    const std::int32_t free_before = pool.NumFreeBlocks();
+
+    EXPECT_EQ(full.SpeculativeBlocksNeededFor(full_table, /*target_num_blocks=*/3), 0);
+    EXPECT_EQ(swa.SpeculativeBlocksNeededFor(swa_table, /*target_num_blocks=*/3), 0);
+    EXPECT_TRUE(full.AcquireSpeculativeBlocks(pool, full_table, /*target_num_blocks=*/3));
+    EXPECT_TRUE(swa.AcquireSpeculativeBlocks(pool, swa_table, /*target_num_blocks=*/3));
+    EXPECT_TRUE(full_table.SpeculativeBlockIds().empty());
+    EXPECT_TRUE(swa_table.SpeculativeBlockIds().empty());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before) << "no speculative pages may be drawn for non-state groups";
+}
+
+TEST(MambaSpeculativeBlocksTest, AllocatesRequestedBlocksOutsideCanonicalPageIds) {
+    BlockPool pool(16);
+    MambaStateManager manager(/*block_size=*/4);
+    BlockTable table;
+    ASSERT_TRUE(manager.Acquire(pool, table, /*num_tokens=*/4));
+    const std::vector<std::int32_t> canonical_ids = BlockTablePageIds(table);
+    const std::int32_t free_before = pool.NumFreeBlocks();
+
+    EXPECT_EQ(manager.SpeculativeBlocksNeededFor(table, /*target_num_blocks=*/3), 3);
+    ASSERT_TRUE(manager.AcquireSpeculativeBlocks(pool, table, /*target_num_blocks=*/3));
+
+    const std::vector<std::int32_t> speculative_ids = table.SpeculativeBlockIds();
+    ASSERT_EQ(speculative_ids.size(), 3u);
+    EXPECT_EQ(std::set(speculative_ids.begin(), speculative_ids.end()).size(), 3u);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before - 3);
+    EXPECT_EQ(BlockTablePageIds(table), canonical_ids)
+        << "speculative State pages must not enter the canonical logical-page table";
+    manager.Free(pool, table);
+}
+
+TEST(MambaSpeculativeBlocksTest, RepeatedAcquireReusesStableBlockIds) {
+    BlockPool pool(16);
+    MambaStateManager manager(/*block_size=*/4);
+    BlockTable table;
+    ASSERT_TRUE(manager.AcquireSpeculativeBlocks(pool, table, /*target_num_blocks=*/3));
+    const std::vector<std::int32_t> first_ids = table.SpeculativeBlockIds();
+    const std::int32_t free_after_first = pool.NumFreeBlocks();
+
+    EXPECT_EQ(manager.SpeculativeBlocksNeededFor(table, /*target_num_blocks=*/3), 0);
+    ASSERT_TRUE(manager.AcquireSpeculativeBlocks(pool, table, /*target_num_blocks=*/3));
+
+    EXPECT_EQ(table.SpeculativeBlockIds(), first_ids);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_after_first);
+    manager.Free(pool, table);
+}
+
+TEST(MambaSpeculativeBlocksTest, CapacityFailureDoesNotPartiallyGrowTable) {
+    BlockPool pool(4);  // 3 usable
+    MambaStateManager manager(/*block_size=*/4);
+    BlockTable table;
+    ASSERT_TRUE(manager.Acquire(pool, table, /*num_tokens=*/4));
+    ASSERT_TRUE(manager.AcquireSpeculativeBlocks(pool, table, /*target_num_blocks=*/1));
+    const std::vector<std::int32_t> ids_before = table.SpeculativeBlockIds();
+    const std::int32_t free_before = pool.NumFreeBlocks();
+
+    EXPECT_EQ(manager.SpeculativeBlocksNeededFor(table, /*target_num_blocks=*/3), 2);
+    EXPECT_FALSE(manager.AcquireSpeculativeBlocks(pool, table, /*target_num_blocks=*/3));
+
+    EXPECT_EQ(table.SpeculativeBlockIds(), ids_before);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_before);
+    EXPECT_EQ(manager.SpeculativeBlocksNeededFor(table, /*target_num_blocks=*/3), 2);
+    manager.Free(pool, table);
+}
+
+TEST(MambaSpeculativeBlocksTest, CoordinatorFreeReturnsCanonicalAndSpeculativeBlocksExactlyOnce) {
+    BlockPool pool(16);
+    std::vector<KvCacheSpec> specs = {
+        {AttnKind::kFull, 4, 0},
+        {AttnKind::kMambaState, 4, 0},
+    };
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    const std::int32_t free_at_start = pool.NumFreeBlocks();
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/4));
+
+    MambaStateManager manager(/*block_size=*/4);
+    ASSERT_TRUE(manager.AcquireSpeculativeBlocks(pool, tables[1], /*target_num_blocks=*/2));
+    ASSERT_EQ(pool.NumFreeBlocks(), free_at_start - 4);  // two canonical + two speculative
+
+    coord.Free(tables);
+    EXPECT_TRUE(tables[1].SpeculativeBlockIds().empty());
+    EXPECT_EQ(pool.NumFreeBlocks(), free_at_start);
+
+    coord.Free(tables);
+    EXPECT_EQ(pool.NumFreeBlocks(), free_at_start) << "an already-freed table must remain a no-op";
+}
+
+// State snapshots are registered for every complete page below the absolute forward end.
+TEST(MambaStateRegistrationTest, AlignedEndRegistersAllFullPages) {
     BlockPool pool(32, true);
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 4, 0}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/12));  // 3 pages
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
-    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/12);
-    // full group: all 3 registered; state group: only page 2 (the aligned chunk end)
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/12);
+    // full group: all 3 registered. state group: ALL 3 too -- the backend now scatters the
+    // kernel's per-P checkpoint into every interior boundary page, so each aligned full page
+    // holds a real snapshot and is hittable (not just the aligned chunk end).
     EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 0)), nullptr);
     EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 1)), nullptr);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[1], 1)), nullptr);
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[0], 1)), nullptr);
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[1], 1)), nullptr);
     EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);
     coord.Free(tables);
 }
 
-TEST(MambaStateRegistrationTest, UnalignedEndRegistersNoStatePages) {
+TEST(MambaStateRegistrationTest, InteriorBoundaryHitAfterAllPagesRegistered) {
+    // The point of registering all aligned pages (not just the last): a second request
+    // sharing an unaligned prefix can now resume the state group off an interior snapshot.
+    BlockPool pool(32, true);
+    std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 4, 0}};
+    KvCacheCoordinator coord = MakeCoordinator(specs, pool);
+    std::vector<BlockTable> tables(coord.NumGroups());
+    ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/12));  // 3 aligned pages
+    std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/12);
+
+    // Second request shares base pages 0,1 (tokens 0..8) then diverges. The state group
+    // resumes off the interior snapshot at page 1 -- impossible under final-page-only
+    // registration, which would leave page 1 a miss and force recompute from scratch.
+    std::vector<std::string> other = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {9, 9, 9, 9}});
+    CoordinatorMatch m = coord.MatchPrefix(other).device;
+    EXPECT_EQ(m.num_common_tokens, 8);  // both groups converge at the interior P boundary
+    ASSERT_EQ(m.per_group.size(), 2u);
+    EXPECT_EQ(m.per_group[1].blocks.size(), 2u) << "state group hits both aligned interior pages";
+    coord.Free(tables);
+}
+
+TEST(MambaStateRegistrationTest, UnalignedEndRegistersCompleteStatePages) {
     BlockPool pool(32, true);
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 4, 0}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/14));  // 3 full pages + partial tail
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}});
-    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/14);  // 14 % 4 != 0
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/14);  // floor(14 / 4) = 3
     EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 0)), nullptr);   // full group unaffected
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);   // state group skipped
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(ch[2], 1)), nullptr);   // complete page retained
     coord.Free(tables);
 }
 
@@ -1454,7 +1620,7 @@ TEST(HeteroFoldedRegistrationTest, EachGroupRegistersAtOwnGranularityThenHits) {
     EXPECT_EQ(tables[1].NumBlocks(), 2);  // 16 / 8
 
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
-    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/16);
 
     // group0: 4 base coarse blocks; group1: 2 folded coarse blocks.
     std::vector<std::string> folded_g1 = FoldBaseHashes(ch, 0, 2);
@@ -1469,9 +1635,9 @@ TEST(HeteroFoldedRegistrationTest, EachGroupRegistersAtOwnGranularityThenHits) {
     coord.Free(tables);
 }
 
-// A mamba (RegistersAlignedFinalPageOnly) group with m>1: only the FINAL aligned folded
-// coarse block registers; the earlier coarse block stays unregistered.
-TEST(HeteroFoldedRegistrationTest, MambaGroupRegistersOnlyFinalFoldedBlock) {
+// A mamba (CachesAlignedStateSnapshots) group with m>1: ALL aligned folded coarse blocks
+// register, since the backend now scatters a per-P checkpoint into every boundary page.
+TEST(HeteroFoldedRegistrationTest, MambaGroupRegistersAllFoldedBlocks) {
     BlockPool pool(64, true);
     std::vector<KvCacheSpec> specs = {{AttnKind::kFull, 4, 0}, {AttnKind::kMambaState, 8, 0}};
     KvCacheCoordinator coord = MakeCoordinator(specs, pool);
@@ -1481,11 +1647,11 @@ TEST(HeteroFoldedRegistrationTest, MambaGroupRegistersOnlyFinalFoldedBlock) {
     EXPECT_EQ(tables[1].NumBlocks(), 2);  // 16 / 8, two folded coarse blocks
 
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
-    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);  // 16 % 8 == 0
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/16);  // 16 % 8 == 0
 
     std::vector<std::string> folded_g1 = FoldBaseHashes(ch, 0, 2);
     ASSERT_EQ(folded_g1.size(), 2u);
-    EXPECT_EQ(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[0], 1)), nullptr);  // interior: skipped
+    EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[0], 1)), nullptr);  // interior: now registered
     EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(folded_g1[1], 1)), nullptr);  // aligned end: registered
     // full group unaffected: all 4 base blocks registered.
     for (const std::string& h : ch) EXPECT_NE(pool.GetCachedBlock(MakeKeyWithGroupId(h, 0)), nullptr);
@@ -1501,7 +1667,7 @@ TEST(HeteroFoldedRegistrationTest, PartialPrefixConvergesInTokens) {
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
-    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/16);
 
     // Second request shares base pages 0,1 (tokens 0..8) then diverges.
     std::vector<std::string> other = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {9, 9, 9, 9}, {8, 8, 8, 8}});
@@ -1522,7 +1688,7 @@ TEST(HeteroFoldedRegistrationTest, FullCycleRestoresPoolBaseline) {
     std::vector<BlockTable> tables(coord.NumGroups());
     ASSERT_TRUE(coord.Acquire(tables, /*num_tokens=*/16));
     std::vector<std::string> ch = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}});
-    coord.CacheFullBlocks(tables, ch, /*first_slot=*/0, /*end_tokens=*/16);
+    coord.CacheFullBlocks(tables, ch, /*first_base_block=*/0, /*end_tokens=*/16);
     coord.Free(tables);
     // Cached-but-free blocks stay in the free list (evictable), so the count returns to baseline.
     EXPECT_EQ(pool.NumFreeBlocks(), free_before);

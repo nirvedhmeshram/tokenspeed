@@ -15,15 +15,21 @@ def _import_bridge():
     """Import the bridge; skip if torch / tokenspeed_scheduler ext absent."""
     from tokenspeed.runtime.engine.scheduler_utils import (
         flat_block_tables_from_forward_op,
+        flat_state_pages_from_forward_op,
+        flat_state_spec_pages_from_forward_op,
     )
 
-    return flat_block_tables_from_forward_op
+    return (
+        flat_block_tables_from_forward_op,
+        flat_state_pages_from_forward_op,
+        flat_state_spec_pages_from_forward_op,
+    )
 
 
 class FlatBlockTablesBridgeTest(unittest.TestCase):
     def setUp(self):
         try:
-            self.bridge = _import_bridge()
+            self.bridge, self.state_bridge, self.verify_state_bridge = _import_bridge()
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(
                 f"flat bridge unavailable (needs torch + tokenspeed_scheduler "
@@ -96,6 +102,138 @@ class FlatBlockTablesBridgeTest(unittest.TestCase):
         op = self._make_op({"full": [], "swa": []})
         self.assertEqual(self.bridge(op, device="cpu", num_reqs=0), {})
         self.assertEqual(self.bridge(op, device="cpu"), {})
+
+    def test_state_pages_follow_explicit_group_order(self):
+        from types import SimpleNamespace
+
+        op = SimpleNamespace(
+            flat_state_in_pages={"shard1": [21, 22], "shard0": [11, 12]},
+            flat_state_out_pages={
+                "shard1": [[31], [32]],
+                "shard0": [[41], [42]],
+            },
+        )
+        pages = self.state_bridge(
+            op, device="cpu", group_ids=("shard0", "shard1"), num_reqs=2
+        )
+        self.assertEqual(pages[0].tolist(), [[11, 12], [21, 22]])
+        self.assertEqual(pages[1].tolist(), [[41, 42], [31, 32]])
+        self.assertEqual(pages.dtype, self.torch.int32)
+
+    def test_state_pages_reject_missing_group(self):
+        from types import SimpleNamespace
+
+        op = SimpleNamespace(
+            flat_state_in_pages={"shard0": [1]},
+            flat_state_out_pages={"shard0": [2]},
+        )
+        with self.assertRaisesRegex(ValueError, "shard1"):
+            self.state_bridge(
+                op, device="cpu", group_ids=("shard0", "shard1"), num_reqs=1
+            )
+
+    def test_verify_spec_pages_preserve_group_order_and_pad_inactive_rows(self):
+        from types import SimpleNamespace
+
+        op = SimpleNamespace(
+            flat_state_spec_pages={
+                "shard1": [[], [211, 212, 213]],
+                "shard0": [[], [111, 112, 113]],
+            },
+        )
+        state_spec = self.verify_state_bridge(
+            op,
+            device="cpu",
+            group_ids=("shard0", "shard1"),
+            num_reqs=2,
+            verify_width=3,
+            num_inactive_prefix_rows=1,
+        )
+        self.assertEqual(tuple(state_spec.shape), (2, 2, 3))
+        self.assertEqual(
+            state_spec.tolist(),
+            [
+                [[-1, -1, -1], [111, 112, 113]],
+                [[-1, -1, -1], [211, 212, 213]],
+            ],
+        )
+
+    def test_verify_spec_pages_reject_invalid_or_duplicate_ids(self):
+        from types import SimpleNamespace
+
+        def op(spec_pages):
+            return SimpleNamespace(
+                flat_state_spec_pages={"shard0": [spec_pages]},
+            )
+
+        with self.assertRaisesRegex(ValueError, "positive"):
+            self.verify_state_bridge(
+                op([101, -1, 103]),
+                device="cpu",
+                group_ids=("shard0",),
+                num_reqs=1,
+                verify_width=3,
+            )
+        with self.assertRaisesRegex(ValueError, "distinct"):
+            self.verify_state_bridge(
+                op([101, 101, 103]),
+                device="cpu",
+                group_ids=("shard0",),
+                num_reqs=1,
+                verify_width=3,
+            )
+        cross_request_alias = SimpleNamespace(
+            flat_state_spec_pages={"shard0": [[101, 102, 103], [111, 102, 113]]},
+        )
+        with self.assertRaisesRegex(ValueError, "across active rows"):
+            self.verify_state_bridge(
+                cross_request_alias,
+                device="cpu",
+                group_ids=("shard0",),
+                num_reqs=2,
+                verify_width=3,
+            )
+
+    def test_verify_spec_pages_reject_wrong_width(self):
+        from types import SimpleNamespace
+
+        op = SimpleNamespace(
+            flat_state_spec_pages={"shard0": [[101, 102]]},
+        )
+        with self.assertRaisesRegex(ValueError, "verify width"):
+            self.verify_state_bridge(
+                op,
+                device="cpu",
+                group_ids=("shard0",),
+                num_reqs=1,
+                verify_width=3,
+            )
+
+    def test_verify_bridge_activation_uses_actual_width(self):
+        from tokenspeed.runtime.engine.scheduler_utils import (
+            should_bridge_flat_state_verify_pages,
+        )
+
+        self.assertFalse(
+            should_bridge_flat_state_verify_pages(
+                spec_num_tokens=None, num_extends=0, num_reqs=2
+            )
+        )
+        self.assertFalse(
+            should_bridge_flat_state_verify_pages(
+                spec_num_tokens=1, num_extends=0, num_reqs=2
+            )
+        )
+        self.assertTrue(
+            should_bridge_flat_state_verify_pages(
+                spec_num_tokens=4, num_extends=1, num_reqs=3
+            )
+        )
+        self.assertFalse(
+            should_bridge_flat_state_verify_pages(
+                spec_num_tokens=4, num_extends=3, num_reqs=3
+            )
+        )
 
 
 class FlatFlagGatingTest(unittest.TestCase):

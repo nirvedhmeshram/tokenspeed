@@ -51,6 +51,17 @@ public:
     std::int32_t NumBlocks() const { return static_cast<std::int32_t>(blocks_.size()); }
     std::int32_t TailAvailableTokens() const { return tail_avail_; }
 
+    // Request-owned State pages reserved for speculative outputs. These are
+    // deliberately separate from the canonical logical-page table.
+    std::vector<std::int32_t> SpeculativeBlockIds() const {
+        std::vector<std::int32_t> ids;
+        ids.reserve(speculative_blocks_.size());
+        for (const BlockRef& ref : speculative_blocks_) {
+            ids.push_back(ref->BlockId());
+        }
+        return ids;
+    }
+
     // Replace slot `index` with a null hole (slot alignment kept) and return the
     // displaced block for the caller to free; nullptr if already a hole.
     CacheBlock* EvictToNull(std::int32_t index, CacheBlock* null_block) {
@@ -71,8 +82,10 @@ public:
 
 private:
     friend class KvCacheManager;
+    friend class MambaStateManager;
 
     std::vector<BlockRef> blocks_{};
+    std::vector<BlockRef> speculative_blocks_{};
     std::int32_t tail_avail_{0};
 };
 

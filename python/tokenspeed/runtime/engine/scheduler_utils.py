@@ -371,6 +371,140 @@ def flat_block_tables_from_forward_op(
     )
 
 
+def flat_state_pages_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    group_ids: Sequence[str],
+    num_reqs: int,
+) -> torch.Tensor:
+    """Copy resolved state pages as [in/out, shard, request]."""
+    device = torch.device(device) if isinstance(device, str) else device
+    gids = tuple(group_ids)
+    if not gids:
+        return torch.empty((2, 0, num_reqs), dtype=torch.int32, device=device)
+
+    matrices: list[list[int]] = []
+    for attr in ("flat_state_in_pages", "flat_state_out_pages"):
+        raw = getattr(forward_op, attr, None)
+        values = dict(raw) if raw is not None else {}
+        is_out = attr == "flat_state_out_pages"
+        matrix: list[int] = []
+        for gid in gids:
+            if gid not in values:
+                raise ValueError(f"{attr} is missing group {gid!r}")
+            row = list(values[gid])
+            if len(row) != num_reqs:
+                raise ValueError(
+                    f"{attr}[{gid}] has {len(row)} pages but num_reqs={num_reqs}"
+                )
+            if is_out:
+                row = [pages[0] if pages else -1 for pages in row]
+            matrix.extend(row)
+        matrices.append(matrix)
+
+    packed = torch.tensor(
+        matrices,
+        dtype=torch.int32,
+        device="cpu",
+        pin_memory=device.type == "cuda",
+    ).view(2, len(gids), num_reqs)
+    packed = packed.to(device, non_blocking=True)
+    return packed
+
+
+def should_bridge_flat_state_verify_pages(
+    *, spec_num_tokens: int | None, num_extends: int, num_reqs: int
+) -> bool:
+    """Whether a scheduler batch contains active multi-token verify rows."""
+    return (spec_num_tokens or 1) > 1 and num_extends < num_reqs
+
+
+def flat_state_spec_pages_from_forward_op(
+    forward_op: Any,
+    device: "torch.device | str",
+    *,
+    group_ids: Sequence[str],
+    num_reqs: int,
+    verify_width: int,
+    num_inactive_prefix_rows: int = 0,
+) -> torch.Tensor:
+    """Bridge request-owned target-verify State checkpoint destinations.
+
+    In a mixed batch, the scheduler stable-partitions prefill rows before active
+    decode rows. ``num_inactive_prefix_rows`` identifies that prefix explicitly:
+    its metadata is normalized to ``-1``. Active rows must contain exactly
+    ``verify_width`` positive, request-distinct page ids. Input and canonical
+    output pages are intentionally absent: runtime resolves them from GPU
+    sequence lengths and the complete Flat block table.
+    """
+    device = torch.device(device) if isinstance(device, str) else device
+    gids = tuple(group_ids)
+    if verify_width <= 0:
+        raise ValueError(f"verify_width must be > 0, got {verify_width}")
+    if not 0 <= num_inactive_prefix_rows <= num_reqs:
+        raise ValueError(
+            "num_inactive_prefix_rows must be between 0 and num_reqs, got "
+            f"{num_inactive_prefix_rows} for num_reqs={num_reqs}"
+        )
+    if not gids:
+        return torch.empty(
+            (0, num_reqs, verify_width), dtype=torch.int32, device=device
+        )
+
+    spec_raw = dict(getattr(forward_op, "flat_state_spec_pages", None) or {})
+    spec_rows: list[list[list[int]]] = []
+    for gid in gids:
+        if gid not in spec_raw:
+            raise ValueError(f"flat_state_spec_pages is missing group {gid!r}")
+        gid_spec = [list(pages) for pages in spec_raw[gid]]
+        if len(gid_spec) != num_reqs:
+            raise ValueError(
+                f"flat_state_spec_pages[{gid}] has {len(gid_spec)} rows, "
+                f"expected {num_reqs}"
+            )
+
+        active_spec_pages: list[int] = []
+        for req_idx in range(num_inactive_prefix_rows, num_reqs):
+            spec_pages = gid_spec[req_idx]
+            if len(spec_pages) != verify_width:
+                raise ValueError(
+                    f"flat_state_spec_pages[{gid}][{req_idx}] has verify width "
+                    f"{len(spec_pages)}, expected {verify_width}"
+                )
+            if any(page <= 0 for page in spec_pages):
+                raise ValueError(
+                    f"flat_state_spec_pages[{gid}][{req_idx}] must contain "
+                    "positive page ids"
+                )
+            if len(set(spec_pages)) != len(spec_pages):
+                raise ValueError(
+                    f"flat_state_spec_pages[{gid}][{req_idx}] must contain "
+                    "distinct page ids"
+                )
+            active_spec_pages.extend(spec_pages)
+        if len(set(active_spec_pages)) != len(active_spec_pages):
+            raise ValueError(
+                f"flat_state_spec_pages[{gid}] must be distinct across active rows"
+            )
+        spec_rows.append(
+            [
+                [-1] * verify_width if req_idx < num_inactive_prefix_rows else pages
+                for req_idx, pages in enumerate(gid_spec)
+            ]
+        )
+    return (
+        torch.tensor(
+            spec_rows,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=device.type == "cuda",
+        )
+        .view(len(gids), num_reqs, verify_width)
+        .to(device, non_blocking=True)
+    )
+
+
 def paged_cache_block_table_base_offsets_from_forward_op(
     forward_op: Any,
     device: "torch.device | str",

@@ -42,43 +42,36 @@ def _identity_dedup(
     return list(seen.values())
 
 
-def _state_slabs(device_kv_pool) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """(conv, ssm) state slab pairs, [] on pools predating state slabs."""
-    return list(getattr(device_kv_pool, "state_slabs", None) or ())
-
-
 def flat_bytes_per_host_page(device_kv_pool) -> int:
     """Bytes one host page occupies across all mirrors, computed from the
     device pool alone (no mirror allocation) -- the sizing side of
     ``FlatHostMirror.bytes_per_host_page`` for host-budget arithmetic.
+
+    GDN state needs no extra term: its bytes alias segments inside the full
+    layers' K/V slabs (state binning), so the byte-blind slab copies
+    below carry them for free.
     """
     tensors = _identity_dedup(device_kv_pool.k_buffer) + _identity_dedup(
         device_kv_pool.v_buffer
     )
     page_size = int(device_kv_pool.page_size)
-    kv_bytes = sum(t.element_size() * t[0].numel() * page_size for t in tensors)
-    # State slabs are page-indexed: one constant row per page id.
-    state_bytes = sum(
-        t.element_size() * t[0].numel()
-        for pair in _state_slabs(device_kv_pool)
-        for t in pair
-    )
-    return kv_bytes + state_bytes
+    return sum(t.element_size() * t[0].numel() * page_size for t in tensors)
 
 
 class FlatHostMirror:
-    """One pinned CPU mirror per DISTINCT device KV tensor plus one per
-    state slab tensor; a (device_page, host_page) pair copies that page's
-    row range on every mirror pair.
+    """One pinned CPU mirror per DISTINCT device KV tensor; a
+    (device_page, host_page) pair copies that page's row range on every
+    mirror pair.
 
     Slab tensors are enumerated once each -- a page's rows are exactly its
     owner group's layers, so byte copies are group-safe by id-exclusivity.
+    GDN state bytes alias segments inside the full layers' K/V slabs
+    (state binning), so the blind slab copies cover them with no
+    state-specific mirrors.
 
-    ``tensor_pairs`` order (PINNED, D2 fencing indexes into it): K*, V*,
-    then state tensors flattened in slab order (conv0, ssm0, conv1, ...).
-    KV mirrors span ``page_size`` token rows per page; state slabs are
-    page-indexed (one snapshot row per page id), so their mirrors span 1
-    row per page -- ``row_spans[i]`` carries each pair's span.
+    ``tensor_pairs`` order (PINNED, D2 fencing indexes into it): K*, V*.
+    Every mirror spans ``page_size`` token rows per page --
+    ``row_spans[i]`` carries each pair's span.
     """
 
     def __init__(self, device_kv_pool, num_host_pages: int):
@@ -95,7 +88,8 @@ class FlatHostMirror:
         k_index = {id(t): i for i, t in enumerate(k_tensors)}
         v_index = {id(t): i for i, t in enumerate(v_tensors)}
         # None entries (flat GDN state layers, no KV) map to None: those
-        # layers fence on state_tensor_indices_of_layer instead.
+        # layers' bytes ride the full layers' slab copies (state aliasing)
+        # and fence on the op's last per-tensor event.
         self._layer_to_k_index = [
             None if t is None else k_index[id(t)] for t in device_kv_pool.k_buffer
         ]
@@ -105,23 +99,8 @@ class FlatHostMirror:
             None if t is None else v_index[id(t)] for t in device_kv_pool.v_buffer
         ], "flat host mirror: K/V dedup orders diverge"
 
-        state_slabs = _state_slabs(device_kv_pool)
-        state_tensors = [t for pair in state_slabs for t in pair]
-
-        # layer -> slab pair index for state layers (identity-matched via
-        # the pool's occurrence-indexed get_state_buffers binding).
-        self._layer_to_state_pair: dict[int, int] = {}
-        if state_slabs:
-            pair_of_conv = {id(conv): n for n, (conv, _) in enumerate(state_slabs)}
-            for layer_id in range(len(device_kv_pool.k_buffer)):
-                try:
-                    conv, _ssm = device_kv_pool.get_state_buffers(layer_id)
-                except ValueError:
-                    continue  # not a state layer
-                self._layer_to_state_pair[layer_id] = pair_of_conv[id(conv)]
-
         pin = torch.cuda.is_available()
-        kv_pairs = [
+        self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
             (
                 dev,
                 torch.zeros(
@@ -131,46 +110,21 @@ class FlatHostMirror:
                 ),
             )
             for dev in k_tensors + v_tensors
-        ]
-        state_pairs = [
-            (
-                dev,
-                torch.zeros(
-                    (self.num_host_pages, *dev.shape[1:]),
-                    dtype=dev.dtype,
-                    pin_memory=pin,
-                ),
-            )
-            for dev in state_tensors
-        ]
-        self.tensor_pairs: tuple[tuple[torch.Tensor, torch.Tensor], ...] = tuple(
-            kv_pairs + state_pairs
         )
-        # Rows one page spans on each pair: page_size token rows for KV,
-        # one page-indexed snapshot row for state slabs.
-        self.row_spans: tuple[int, ...] = (self.page_size,) * len(kv_pairs) + (
-            1,
-        ) * len(state_pairs)
+        # Rows one page spans on each pair (uniform now that state carries
+        # no page-indexed snapshot mirrors).
+        self.row_spans: tuple[int, ...] = (self.page_size,) * len(self.tensor_pairs)
 
     def tensor_index_of_layer(self, layer_id: int) -> int:
         """Index of layer_id's K tensor in tensor_pairs (paired slab layers
         share the index); its V tensor is at index + num_k_tensors.
-        Raises ValueError for flat GDN state layers (no KV tensor); fence
-        those on state_tensor_indices_of_layer instead."""
+        Raises ValueError for flat GDN state layers (no KV tensor); their
+        aliased state bytes ride the full layers' slab copies, so fence
+        them on the op's last per-tensor event."""
         index = self._layer_to_k_index[layer_id]
         if index is None:
             raise ValueError(f"layer {layer_id} is a state layer; it has no KV mirror")
         return index
-
-    def state_tensor_indices_of_layer(self, layer_id: int) -> tuple[int, int] | None:
-        """(conv_idx, ssm_idx) of layer_id's state slab pair in tensor_pairs
-        (conv immediately precedes its ssm), or None for layers without
-        state."""
-        pair = self._layer_to_state_pair.get(layer_id)
-        if pair is None:
-            return None
-        base = 2 * self.num_k_tensors + 2 * pair
-        return base, base + 1
 
     def bytes_per_host_page(self) -> int:
         return sum(

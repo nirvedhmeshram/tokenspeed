@@ -110,11 +110,36 @@ public:
         return (over + block_size_ - 1) / block_size_;
     }
 
-    // State snapshots are only boundary-correct where a forward call ended page-aligned:
-    // such groups register just the final full page of an aligned range.
-    virtual bool RegistersAlignedFinalPageOnly() const { return false; }
+    // True when complete pages below a known forward end carry aligned recurrent-state snapshots
+    // and can be registered as prefix-cache entries.
+    virtual bool CachesAlignedStateSnapshots() const { return false; }
+
+    // True when non-final prefill chunks must end on the cache-group LCM checkpoint grid.
+    virtual bool RequiresAlignedPrefillChunks() const { return false; }
+
+    // Highest token boundary against which this group may safely reclaim.
+    // Recurrent State can move it earlier to keep the page that supplies a
+    // pending forward's input state; ordinary KV uses the full computed end.
+    virtual std::int32_t SafeReclaimBoundary(std::int32_t computed_end_tokens,
+                                             std::int32_t /*protected_input_tokens*/) const {
+        return computed_end_tokens;
+    }
+
+    // Speculative decode grows a request-owned segment only for recurrent-state groups.
+    // Non-state groups cover their candidate tokens through the ordinary num_tokens page
+    // math, so the default is "0 extra pages, already satisfied".
+    virtual std::int32_t SpeculativeBlocksNeededFor(const BlockTable& /*table*/,
+                                                    std::int32_t /*target_num_blocks*/) const {
+        return 0;
+    }
+    virtual bool AcquireSpeculativeBlocks(BlockPool& /*pool*/, BlockTable& /*table*/,
+                                          std::int32_t /*target_num_blocks*/) {
+        return true;
+    }
 
     // Pages already carrying a hash are skipped; the partial tail is excluded by the caller.
+    // first_slot is a table-local block index (into this table's blocks_), NOT the base-granular
+    // index the coordinator folds from -- the coordinator converts before calling in.
     void CacheFullBlocks(BlockPool& pool, BlockTable& table, std::span<const std::string> block_hashes,
                          std::int32_t first_slot = 0,
                          std::vector<std::pair<std::string, CacheBlock*>>* newly_cached = nullptr) {
@@ -151,12 +176,16 @@ public:
         // Free-list order is semantics -- oldest-first recycling, pinned by tests -- so keep one
         // front->back batch here; per-ref destructors only cover stray/unwind paths.
         std::vector<CacheBlock*> batch;
-        batch.reserve(table.blocks_.size());
+        batch.reserve(table.blocks_.size() + table.speculative_blocks_.size());
         for (BlockRef& ref : table.blocks_) {
+            batch.push_back(ref.Release());
+        }
+        for (BlockRef& ref : table.speculative_blocks_) {
             batch.push_back(ref.Release());
         }
         pool.FreeBlocks(batch);
         table.blocks_.clear();
+        table.speculative_blocks_.clear();
         table.tail_avail_ = 0;
     }
 

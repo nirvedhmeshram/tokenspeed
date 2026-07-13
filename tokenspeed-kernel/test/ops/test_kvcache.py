@@ -20,13 +20,66 @@
 
 from __future__ import annotations
 
+import math
+
+import pytest
 import torch
+from tokenspeed_kernel.ops.kvcache import flat_mtp_state_commit
 from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_kv_all_layer,
     transfer_kv_all_layer_mla,
     transfer_kv_per_layer,
     transfer_kv_per_layer_mla,
 )
+
+
+def test_flat_mtp_state_commit_strided_rows(device: str) -> None:
+    spec_pages = torch.tensor(
+        [[1, 2, 3, 4], [5, 6, 7, 11], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    out_pages = torch.tensor(
+        [[8, 8, 9, 9], [10, 10, 10, 10], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    accepted_lengths = torch.tensor([3, 2, 4], dtype=torch.int32, device=device)
+
+    for dtype, shape in (
+        (torch.bfloat16, (5, 3)),
+        (torch.float32, (2, 3, 4)),
+    ):
+        row_elements = math.prod(shape)
+        state = torch.empty_strided(
+            (16, *shape),
+            (row_elements + 17, *torch.empty(shape).stride()),
+            dtype=dtype,
+            device=device,
+        )
+        values = torch.arange(
+            state.shape[0] * row_elements, dtype=torch.float32, device=device
+        ).reshape(state.shape[0], *shape)
+        state.copy_(values.to(dtype))
+        before = state.clone()
+
+        flat_mtp_state_commit(state, spec_pages, out_pages, accepted_lengths)
+        torch.cuda.synchronize()
+
+        assert torch.equal(state[8], before[2])
+        assert torch.equal(state[9], before[3])
+        assert torch.equal(state[10], before[6])
+        assert torch.equal(state[4], before[4])
+        assert torch.equal(state[12], before[12])
+
+
+def test_flat_mtp_state_commit_rejects_noncontiguous_accepted_lengths() -> None:
+    state = torch.empty((4, 2), dtype=torch.float32)
+    pages = torch.ones((2, 2), dtype=torch.int32)
+    accepted_lengths = torch.tensor([1, 99, 2, 99], dtype=torch.int32)[::2]
+
+    with pytest.raises(ValueError, match="accepted_lengths must be contiguous"):
+        flat_mtp_state_commit(state, pages, pages, accepted_lengths)
 
 
 def test_transfer_kv_per_layer(device: str) -> None:

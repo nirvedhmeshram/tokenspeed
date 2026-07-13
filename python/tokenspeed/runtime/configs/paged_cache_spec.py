@@ -408,6 +408,7 @@ def group_specs_from_layer_types(
     layer_types: Sequence[str],
     sliding_window_tokens: int | Sequence[int | None] | None,
     page_size: int,
+    num_state_shards: int | None = None,
 ) -> list[PagedCacheGroupSpec]:
     """Derive paged-cache group specs from per-layer attention types.
 
@@ -421,17 +422,42 @@ def group_specs_from_layer_types(
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
         page_size: Tokens per page (uniform across groups).
+        num_state_shards: State-shard fan-out k (state binning). ``None``
+            is the legacy path: each state-family group publishes under its
+            bare ``gid`` (today's single-group layout). Any non-None value
+            must be >= 1 and switches on sharded publication: each state group
+            expands into k ``{gid}_shard{i}`` groups (identical
+            retention/layout) at its first-appearance position, so k=1 yields
+            exactly ``{gid}_shard0``.
 
     Raises:
-        ValueError: unknown label; window sequence length mismatch; sliding
-            layer without a positive window; full layer carrying a window.
+        ValueError: num_state_shards is non-None and < 1; unknown label;
+            window sequence length mismatch; sliding layer without a positive
+            window; full layer carrying a window.
     """
+    if num_state_shards is not None and num_state_shards < 1:
+        raise ValueError(
+            f"num_state_shards must be >= 1 when set, got {num_state_shards}"
+        )
     specs: list[PagedCacheGroupSpec] = []
     seen: set[str] = set()
     for gid, retention, window in _layer_specs(layer_types, sliding_window_tokens):
         if gid in seen:
             continue
         seen.add(gid)
+        if gid in STATE_LAYER_TYPES and num_state_shards is not None:
+            specs.extend(
+                PagedCacheGroupSpec(
+                    group_id=f"{gid}_shard{i}",
+                    retention=retention,
+                    rows_per_page=page_size,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=window,
+                    family="state",
+                )
+                for i in range(num_state_shards)
+            )
+            continue
         specs.append(
             PagedCacheGroupSpec(
                 group_id=gid,
@@ -454,6 +480,7 @@ def publish_paged_cache_groups(
     max_scheduled_tokens: int,
     max_total_tokens: int,
     max_context_len: int,
+    num_state_shards: int | None = None,
 ) -> tuple[list[PagedCacheGroupSpec], dict[str, int]] | None:
     """Publication rule (canonical) for a KV pool's paged-cache groups.
 
@@ -467,8 +494,9 @@ def publish_paged_cache_groups(
     Args:
         layer_types: Per-layer paged-cache labels (empty -> single
             full-history group).
-        sliding_window_tokens / page_size: Forwarded to
-            group_specs_from_layer_types.
+        sliding_window_tokens / page_size / num_state_shards: Forwarded to
+            group_specs_from_layer_types (num_state_shards None -> legacy
+            bare-name state groups; non-None -> k sharded groups).
         max_live_requests / max_scheduled_tokens / max_total_tokens /
             max_context_len: Sizing inputs for
             compute_paged_cache_group_page_counts.
@@ -482,6 +510,7 @@ def publish_paged_cache_groups(
         layer_types=tuple(layer_types) or (FULL_ATTENTION,),
         sliding_window_tokens=sliding_window_tokens,
         page_size=page_size,
+        num_state_shards=num_state_shards,
     )
     counts = compute_paged_cache_group_page_counts(
         specs,

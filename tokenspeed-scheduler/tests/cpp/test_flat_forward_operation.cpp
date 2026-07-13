@@ -140,6 +140,59 @@ TEST(FlatForwardOperation, GroupKeyUnionAcrossRequestsPadsMissingGroup) {
     EXPECT_EQ(swa.at(1), (std::vector<std::int32_t>{20, 21, 22}));
 }
 
+TEST(FlatForwardOperation, ResolvedStatePagesFollowPartitionedRequestOrder) {
+    auto decode = MakeDecode("d", FlatTable{{"state", {20, 21}}});
+    decode.flat_state_in_pages = {{"state", 20}};
+    decode.flat_state_out_pages = {{"state", {21}}};
+    auto prefill = MakePrefill("p", FlatTable{{"state", {10, 11}}}, {1, 2});
+    prefill.flat_state_in_pages = {{"state", 0}};
+    prefill.flat_state_out_pages = {{"state", {11}}};
+
+    std::vector<ForwardOperation> ops;
+    ops.emplace_back(std::move(decode));
+    ops.emplace_back(std::move(prefill));
+    FlatForwardOperation flat_op{std::move(ops)};
+
+    EXPECT_EQ(flat_op.request_ids, (std::vector<std::string>{"p", "d"}));
+    EXPECT_EQ(flat_op.flat_state_in_pages.at("state"),
+              (std::vector<std::int32_t>{0, 20}));
+    EXPECT_EQ(flat_op.flat_state_out_pages.at("state"),
+              (std::vector<std::vector<std::int32_t>>{{11}, {21}}));
+}
+
+TEST(FlatForwardOperation, MultiPositionStateOutPagesPadToMaxVerifyWidth) {
+    auto d0 = MakeDecode("d0", FlatTable{{"state", {30, 31, 32}}});
+    d0.flat_state_in_pages = {{"state", 30}};
+    d0.flat_state_out_pages = {{"state", {31, 32}}};
+    auto d1 = MakeDecode("d1", FlatTable{{"state", {40}}});
+    d1.flat_state_in_pages = {{"state", 40}};
+    d1.flat_state_out_pages = {{"state", {41}}};
+
+    std::vector<ForwardOperation> ops;
+    ops.emplace_back(std::move(d0));
+    ops.emplace_back(std::move(d1));
+    FlatForwardOperation flat_op{std::move(ops)};
+
+    EXPECT_EQ(flat_op.flat_state_out_pages.at("state"),
+              (std::vector<std::vector<std::int32_t>>{{31, 32}, {41, -1}}));
+}
+
+TEST(FlatForwardOperation, SpeculativeStatePagesFollowPartitionedOrderAndPadWithMinusOne) {
+    auto decode = MakeDecode("d", FlatTable{{"state", {20, 21}}});
+    decode.flat_state_spec_pages = {{"state", {30, 31, 32}}};
+    auto prefill = MakePrefill("p", FlatTable{{"state", {10, 11}}}, {1, 2});
+    prefill.flat_state_spec_pages = {{"state", {40}}};
+
+    std::vector<ForwardOperation> ops;
+    ops.emplace_back(std::move(decode));
+    ops.emplace_back(std::move(prefill));
+    FlatForwardOperation flat_op{std::move(ops)};
+
+    EXPECT_EQ(flat_op.request_ids, (std::vector<std::string>{"p", "d"}));
+    EXPECT_EQ(flat_op.flat_state_spec_pages.at("state"),
+              (std::vector<std::vector<std::int32_t>>{{40, -1, -1}, {30, 31, 32}}));
+}
+
 TEST(FlatForwardOperation, ScalarFieldsTrackPerRequestRows) {
     std::vector<ForwardOperation> ops;
     auto p0 = MakePrefill("r0", FlatTable{{"full", {10}}}, /*input_ids=*/{1, 2, 3},

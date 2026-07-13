@@ -49,7 +49,15 @@ def _make_config() -> ts.SchedulerConfig:
         sliding_window_tokens=4,
         family=ts.PagedCacheGroupFamily.State,
     )
-    cfg.paged_cache_groups = [full, swa]
+    mamba = ts.PagedCacheGroupConfig(
+        group_id="mamba",
+        rows_per_page=cfg.block_size,
+        entry_stride_tokens=1,
+        total_pages=cfg.num_device_pages,
+        retention=ts.PagedCacheRetention.FullHistory,
+        family=ts.PagedCacheGroupFamily.State,
+    )
+    cfg.paged_cache_groups = [full, swa, mamba]
     return cfg
 
 
@@ -114,6 +122,34 @@ def test_prefill_produces_per_group_block_tables():
     full_row = list(tables["full"][0])
     assert full_row, "full-history row should be non-empty after prefill"
     assert all(page_id > 0 for page_id in full_row)
+
+
+def test_prefill_resolves_mamba_pages_and_decode_exposes_only_table():
+    scheduler = ts.Scheduler(_make_config())
+    scheduler.submit_requests([_make_spec("r1", num_pages=2)])
+
+    prefill = _find_flat_op(scheduler.next_execution_plan())
+    assert prefill is not None
+    prefill_tables = dict(prefill.flat_block_tables)
+    prefill_in = dict(prefill.flat_state_in_pages)
+    prefill_out = dict(prefill.flat_state_out_pages)
+    assert list(prefill_in["mamba"]) == [0]
+    assert [list(row) for row in prefill_out["mamba"]] == [
+        [prefill_tables["mamba"][0][1]]
+    ]
+    assert "swa" not in prefill_in
+
+    _advance_tokens(scheduler, "r1", [42])
+    decode = _find_flat_op(scheduler.next_execution_plan())
+    assert decode is not None
+    decode_tables = dict(decode.flat_block_tables)
+    decode_in = dict(decode.flat_state_in_pages)
+    decode_out = dict(decode.flat_state_out_pages)
+    assert len(decode_tables["mamba"][0]) >= 3
+    assert decode_tables["mamba"][0][1] > 0
+    assert decode_tables["mamba"][0][2] > 0
+    assert decode_in == {}
+    assert decode_out == {}
 
 
 def test_decode_slides_swa_window_to_null_hole():

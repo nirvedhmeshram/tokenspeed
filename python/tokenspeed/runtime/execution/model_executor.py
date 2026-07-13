@@ -36,8 +36,11 @@ from tokenspeed.runtime.configs.paged_cache_spec import (
 from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.engine.scheduler_utils import (
     flat_block_tables_from_forward_op,
+    flat_state_pages_from_forward_op,
+    flat_state_spec_pages_from_forward_op,
     paged_cache_block_table_base_offsets_from_forward_op,
     paged_cache_block_tables_from_forward_op,
+    should_bridge_flat_state_verify_pages,
 )
 from tokenspeed.runtime.execution.cache_loc_kernel import update_block_table
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -269,6 +272,15 @@ class ModelExecutor:
                 and getattr(spec, "retention", None) == "full_history"
             ),
             None,
+        )
+        state_prefix = "linear_attention_shard"
+        num_state_shards = (
+            sum(str(spec.group_id).startswith(state_prefix) for spec in _group_specs)
+            if scheduler_ext_flat_kvcache()
+            else 0
+        )
+        self._flat_state_group_ids = tuple(
+            f"{state_prefix}{i}" for i in range(num_state_shards)
         )
         self._mirror_idx_cpu: torch.Tensor | None = None
         self._mirror_idx_dev: torch.Tensor | None = None
@@ -1689,6 +1701,39 @@ class ModelExecutor:
                 device=self.device,
                 num_reqs=bs,
             )
+            has_flat_state_execution_pages = bool(
+                getattr(forward_op, "flat_state_in_pages", None)
+            ) or bool(getattr(forward_op, "flat_state_out_pages", None))
+            flat_state_pages = (
+                flat_state_pages_from_forward_op(
+                    forward_op,
+                    device=self.device,
+                    group_ids=self._flat_state_group_ids,
+                    num_reqs=bs,
+                )
+                if self._flat_state_group_ids and has_flat_state_execution_pages
+                else None
+            )
+            flat_state_spec_pages = (
+                flat_state_spec_pages_from_forward_op(
+                    forward_op,
+                    device=self.device,
+                    group_ids=self._flat_state_group_ids,
+                    num_reqs=bs,
+                    verify_width=self.config.spec_num_tokens or 1,
+                    num_inactive_prefix_rows=num_extends,
+                )
+                if (
+                    self._flat_state_group_ids
+                    and self.config.spec_algo is not None
+                    and should_bridge_flat_state_verify_pages(
+                        spec_num_tokens=self.config.spec_num_tokens,
+                        num_extends=num_extends,
+                        num_reqs=bs,
+                    )
+                )
+                else None
+            )
             self._mirror_flat_full_table_into_req_to_page(forward_op, flat_block_tables)
             decode_input_ids = self.input_buffers.fill_input_buffers(
                 forward_op=forward_op,
@@ -1911,6 +1956,8 @@ class ModelExecutor:
                             paged_cache_block_table_base_offsets
                         ),
                         flat_block_tables=flat_block_tables,
+                        flat_state_pages=flat_state_pages,
+                        flat_state_spec_pages=flat_state_spec_pages,
                         **mamba_kwargs,
                     )
                     if timing_enabled:

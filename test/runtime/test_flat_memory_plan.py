@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import pathlib
 import sys
 import unittest
+from types import SimpleNamespace
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,6 +44,213 @@ components_from_layers = _fmp.components_from_layers
 shard_bin_table = _fmp.shard_bin_table
 ShardBinEntry = _fmp.ShardBinEntry
 StateShardBinTable = _fmp.StateShardBinTable
+head_addressing_maps = _fmp.head_addressing_maps
+StateLayerHeadMap = _fmp.StateLayerHeadMap
+solve_base_block_geometry = _fmp.solve_base_block_geometry
+BaseBlockGeometry = _fmp.BaseBlockGeometry
+
+
+class FlatStateCapacityTest(unittest.TestCase):
+    def _plan(self, *, num_blocks=101, block_bytes=10_000):
+        return _fmp.FlatMemoryPlan(
+            geometry=BlockGeometry(
+                block_size=TP8_KW["block_size"],
+                block_bytes=block_bytes,
+                num_blocks=num_blocks,
+            ),
+            tensors=(),
+        )
+
+    def test_capacity_uses_physical_plan_and_state_bin_geometry(self):
+        table = shard_bin_table(**TP8_KW)
+        capacity = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=table,
+            verify_width=4,
+            num_page_ids=81,
+        )
+
+        self.assertEqual(capacity.physical_page_bytes, 10_000)
+        self.assertEqual(
+            capacity.logical_state_payload_bytes_per_checkpoint, 30 * (4 * 65536 + 6144)
+        )
+        self.assertEqual(capacity.usable_page_ids, 80)
+        self.assertEqual(capacity.state_shard_count, 4)
+        self.assertEqual(capacity.canonical_pages_per_request, 8)
+        self.assertEqual(capacity.speculative_pages_per_request, 16)
+        self.assertEqual(capacity.total_state_pages_per_request, 24)
+        self.assertEqual(capacity.state_limited_request_concurrency, 3)
+
+    def test_width_one_has_no_speculative_page_charge(self):
+        capacity = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=shard_bin_table(**TP8_KW),
+            verify_width=1,
+            num_page_ids=81,
+        )
+
+        self.assertEqual(capacity.speculative_pages_per_request, 0)
+        self.assertEqual(capacity.total_state_pages_per_request, 8)
+        self.assertEqual(capacity.state_limited_request_concurrency, 10)
+
+    def test_graph_gate_caps_only_effective_capture_max(self):
+        capacity = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=shard_bin_table(**TP8_KW),
+            verify_width=4,
+            num_page_ids=81,
+        )
+        config = SimpleNamespace(
+            max_cudagraph_capture_size=64,
+            max_num_seqs=256,
+            cudagraph_capture_sizes=[1, 2, 4, 8],
+        )
+
+        reduction = _fmp.apply_flat_state_capacity_graph_gate(config, capacity)
+
+        self.assertEqual(reduction, (64, 3))
+        self.assertEqual(config.max_cudagraph_capture_size, 3)
+        self.assertEqual(config.max_num_seqs, 256)
+        self.assertEqual(config.cudagraph_capture_sizes, [1, 2, 4, 8])
+
+    def test_graph_gate_keeps_one_reachable_explicit_capture_bucket(self):
+        capacity = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=shard_bin_table(**TP8_KW),
+            verify_width=4,
+            num_page_ids=81,
+        )
+        config = SimpleNamespace(
+            max_cudagraph_capture_size=64,
+            cudagraph_capture_sizes=[4, 8],
+        )
+
+        _fmp.apply_flat_state_capacity_graph_gate(config, capacity)
+
+        self.assertEqual(config.cudagraph_capture_sizes, [4, 8, 3])
+        reachable = [
+            size
+            for size in config.cudagraph_capture_sizes
+            if 0 < size <= config.max_cudagraph_capture_size
+        ]
+        self.assertEqual(reachable, [3])
+
+    def test_graph_gate_does_not_repair_preexisting_empty_capture_set(self):
+        capacity = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=shard_bin_table(**TP8_KW),
+            verify_width=4,
+            num_page_ids=241,
+        )
+        config = SimpleNamespace(
+            max_cudagraph_capture_size=3,
+            cudagraph_capture_sizes=[4, 8],
+        )
+
+        reduction = _fmp.apply_flat_state_capacity_graph_gate(config, capacity)
+
+        self.assertEqual(reduction, (3, 3))
+        self.assertEqual(config.cudagraph_capture_sizes, [4, 8])
+
+    def test_graph_gate_fails_when_one_request_cannot_fit(self):
+        capacity = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=shard_bin_table(**TP8_KW),
+            verify_width=4,
+            num_page_ids=24,
+        )
+        config = SimpleNamespace(max_cudagraph_capture_size=64)
+
+        with self.assertRaisesRegex(RuntimeError, "cannot represent one request"):
+            _fmp.apply_flat_state_capacity_graph_gate(config, capacity)
+
+    def test_graph_gate_is_noop_without_mtp(self):
+        config = SimpleNamespace(max_cudagraph_capture_size=64)
+        width_one = _fmp.flat_state_capacity_from_plan(
+            self._plan(),
+            state_bin_table=shard_bin_table(**TP8_KW),
+            verify_width=1,
+            num_page_ids=81,
+        )
+
+        self.assertIsNone(_fmp.apply_flat_state_capacity_graph_gate(config, None))
+        self.assertIsNone(_fmp.apply_flat_state_capacity_graph_gate(config, width_one))
+        self.assertEqual(config.max_cudagraph_capture_size, 64)
+
+
+class BaseBlockGeometryTest(unittest.TestCase):
+    """Shared base-block sizing: one 64KB homogeneous block divides both the
+    per-layer ssm bytes and the per-full-layer KV bytes/token across Qwen3.5
+    sizes/TPs (the dual-quantum coincidence)."""
+
+    HEAD_CELL = 128 * 128 * 4  # ssm head cell, fp32 = 64KB, same for 35B/397B
+
+    def test_397b_tp8_dual_quantum_coincides(self):
+        # 397B-A17B tp8: 8 ssm heads/layer -> 512KB; full-layer KV 1024 B/token.
+        geo = solve_base_block_geometry(
+            ssm_bytes_per_layer=8 * self.HEAD_CELL,
+            kv_bytes_per_token=1024,
+            base_block_bytes=self.HEAD_CELL,
+        )
+        self.assertEqual(geo.base_block_bytes, 65536)
+        self.assertEqual(geo.blocks_per_state_layer, 8)
+        self.assertEqual(
+            geo.kv_tokens_per_block, 64
+        )  # KV P=64 (was 512 under equalizer)
+
+    def test_35b_tp8_smaller_n(self):
+        # 35B-A3B tp8: 4 ssm heads/layer -> 256KB; KV 1024 B/token.
+        geo = solve_base_block_geometry(
+            ssm_bytes_per_layer=4 * self.HEAD_CELL,
+            kv_bytes_per_token=1024,
+            base_block_bytes=self.HEAD_CELL,
+        )
+        self.assertEqual(geo.blocks_per_state_layer, 4)
+        self.assertEqual(geo.kv_tokens_per_block, 64)
+
+    def test_35b_tp1_larger_n_smaller_kv_grain(self):
+        # 35B-A3B tp1: 32 ssm heads/layer -> 2MB; KV 2048 B/token (tp1).
+        geo = solve_base_block_geometry(
+            ssm_bytes_per_layer=32 * self.HEAD_CELL,
+            kv_bytes_per_token=2048,
+            base_block_bytes=self.HEAD_CELL,
+        )
+        self.assertEqual(geo.blocks_per_state_layer, 32)
+        self.assertEqual(geo.kv_tokens_per_block, 32)  # 64KB / 2048
+
+    def test_397b_tp4_dual_quantum_coincides(self):
+        # 397B tp4: 16 ssm heads/layer -> 1MB; KV 1024 B/token.
+        geo = solve_base_block_geometry(
+            ssm_bytes_per_layer=16 * self.HEAD_CELL,
+            kv_bytes_per_token=1024,
+            base_block_bytes=self.HEAD_CELL,
+        )
+        self.assertEqual(geo.blocks_per_state_layer, 16)
+        self.assertEqual(geo.kv_tokens_per_block, 64)
+
+    def test_ssm_not_divisible_raises(self):
+        with self.assertRaisesRegex(ValueError, "state layer would need padding"):
+            solve_base_block_geometry(
+                ssm_bytes_per_layer=100_000,  # not a multiple of 64KB
+                kv_bytes_per_token=1024,
+                base_block_bytes=self.HEAD_CELL,
+            )
+
+    def test_kv_not_whole_tokens_raises(self):
+        with self.assertRaisesRegex(ValueError, "whole number of KV"):
+            solve_base_block_geometry(
+                ssm_bytes_per_layer=8 * self.HEAD_CELL,
+                kv_bytes_per_token=1500,  # 64KB not a whole number of these
+                base_block_bytes=self.HEAD_CELL,
+            )
+
+    def test_nonpositive_base_raises(self):
+        with self.assertRaisesRegex(ValueError, "must be > 0"):
+            solve_base_block_geometry(
+                ssm_bytes_per_layer=8 * self.HEAD_CELL,
+                kv_bytes_per_token=1024,
+                base_block_bytes=0,
+            )
 
 
 class EqualizerTest(unittest.TestCase):
@@ -471,6 +680,117 @@ class ShardBinTableTest(unittest.TestCase):
     def test_bin_table_rejects_odd_kv_cell(self):
         with self.assertRaisesRegex(ValueError, "even"):
             shard_bin_table(**{**TP8_KW, "kv_cell_bytes_per_tok": 1023})
+
+
+SSM_HEAD_ELEMS = 128 * 128  # temporal_state_shape[1:] = (128, 128); fp32 -> itemsize 4
+
+
+class HeadAddressingTest(unittest.TestCase):
+    def test_tp8_per_head_maps_match_ssm_entries(self):
+        bt = shard_bin_table(**TP8_KW)
+        maps = head_addressing_maps(bt, ssm_head_elems=SSM_HEAD_ELEMS)
+        # 30 state layers -> 30 maps, each covering heads_per_layer == 4 heads.
+        self.assertEqual(len(maps), 30)
+        self.assertEqual(len(maps[0].head_shard), 4)
+        self.assertEqual(len(maps[0].head_elem_offset), 4)
+        # Hand calc from the real bin table (printed ssm_entries[:2] of layer 0):
+        #   entry0: head_begin=0 num_heads=2 shard=0 nbytes=131072 byte_offset=0
+        #   entry1: head_begin=2 num_heads=2 shard=0 nbytes=131072 byte_offset=0
+        # itemsize = (131072//2)//16384 = 65536//16384 = 4 bytes (fp32).
+        # entry0 elem_base = 0//4 = 0 -> heads 0,1 at 0, 0+16384.
+        # entry1 elem_base = 0//4 = 0 -> heads 2,3 at 0, 0+16384.
+        # Both groups sit at byte_offset 0 of their (distinct kv_side) segments,
+        # so heads 0 and 2 both land at element 0 within their shard's ssm view.
+        self.assertEqual(maps[0].head_shard, (0, 0, 0, 0))
+        self.assertEqual(maps[0].head_elem_offset, (0, 16384, 0, 16384))
+        # Two heads within one group differ by exactly one ssm head cell.
+        self.assertEqual(
+            maps[0].head_elem_offset[1] - maps[0].head_elem_offset[0], SSM_HEAD_ELEMS
+        )
+        self.assertEqual(
+            maps[0].head_elem_offset[3] - maps[0].head_elem_offset[2], SSM_HEAD_ELEMS
+        )
+
+    def test_tp1_32_heads_span_multiple_shards(self):
+        # tp1: 32 ssm heads/layer, H_g=4 -> 8 head groups per state layer.
+        # num_full_layers=1 gives segs_per_shard=2*1=2, so consecutive groups
+        # spread across shards fastest; the layer's 8 groups cover 4 distinct
+        # shards (the K and V side of each shard-slab pair share a shard, so 8
+        # groups can never reach 8 distinct shards here).
+        kw = dict(
+            num_full_layers=1,
+            num_state_layers=30,
+            ssm_heads_per_layer=32,
+            ssm_head_bytes=65536,
+            conv_bytes_per_layer=49152,
+            kv_cell_bytes_per_tok=2048,
+            block_size=256,
+        )
+        bt = shard_bin_table(**kw)
+        self.assertEqual(bt.heads_per_group, 4)
+        maps = head_addressing_maps(bt, ssm_head_elems=SSM_HEAD_ELEMS)
+        self.assertEqual(len(maps[0].head_shard), 32)
+        self.assertEqual(sorted(set(maps[0].head_shard)), [0, 1, 2, 3])
+        # Within each 4-head group the offsets tile one cell apart from base 0.
+        for begin in range(0, 32, 4):
+            grp = maps[0].head_elem_offset[begin : begin + 4]
+            self.assertEqual(grp, tuple(h * SSM_HEAD_ELEMS for h in range(4)))
+
+    def test_non_contiguous_head_groups_raise(self):
+        bt = shard_bin_table(**TP8_KW)
+        # Drop layer 0's first ssm group (head_begin=0) so the surviving group
+        # starts at head_begin=2 -> head order no longer tiles from 0.
+        pruned = tuple(
+            e for e in bt.ssm_entries if not (e.state_layer == 0 and e.head_begin == 0)
+        )
+        holed = dataclasses.replace(bt, ssm_entries=pruned)
+        with self.assertRaisesRegex(ValueError, "contiguously"):
+            head_addressing_maps(holed, ssm_head_elems=SSM_HEAD_ELEMS)
+
+    def test_dropped_tail_head_group_raises(self):
+        # Use tp1's 8-groups-per-layer table so a state layer has a genuine tail
+        # group (head_begin=28) to drop; the survivors still tile [0, 28)
+        # contiguously, so only the tail-coverage check can catch the loss.
+        kw = dict(
+            num_full_layers=1,
+            num_state_layers=30,
+            ssm_heads_per_layer=32,
+            ssm_head_bytes=65536,
+            conv_bytes_per_layer=49152,
+            kv_cell_bytes_per_tok=2048,
+            block_size=256,
+        )
+        bt = shard_bin_table(**kw)
+        last_begin = max(e.head_begin for e in bt.ssm_entries if e.state_layer == 0)
+        pruned = tuple(
+            e
+            for e in bt.ssm_entries
+            if not (e.state_layer == 0 and e.head_begin == last_begin)
+        )
+        docked = dataclasses.replace(bt, ssm_entries=pruned)
+        with self.assertRaisesRegex(ValueError, "tail head group is missing"):
+            head_addressing_maps(docked, ssm_head_elems=SSM_HEAD_ELEMS)
+
+    def test_single_shard_degenerate_flat_offsets(self):
+        # k=1: one segment holds all heads of a layer (heads_per_group >= heads),
+        # so every head maps to shard 0 with a plain per-cell stride.
+        kw = dict(
+            num_full_layers=16,
+            num_state_layers=30,
+            ssm_heads_per_layer=4,
+            ssm_head_bytes=65536,
+            conv_bytes_per_layer=6144,
+            kv_cell_bytes_per_tok=4096,
+            block_size=256,
+        )
+        bt = shard_bin_table(**kw)
+        self.assertEqual(bt.num_shards, 1)
+        maps = head_addressing_maps(bt, ssm_head_elems=SSM_HEAD_ELEMS)
+        self.assertEqual(maps[0].head_shard, (0, 0, 0, 0))
+        self.assertEqual(
+            maps[0].head_elem_offset,
+            tuple(h * SSM_HEAD_ELEMS for h in range(4)),
+        )
 
 
 if __name__ == "__main__":

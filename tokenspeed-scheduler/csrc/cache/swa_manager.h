@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <ranges>
 #include <span>
 #include <string>
 #include <utility>
@@ -76,16 +77,30 @@ public:
         return match;
     }
 
+private:
+    // Pages [0, result) fully slid out: the next query reads keys [num_computed - window + 1, num_computed].
+    std::int32_t fullySlidOutBlocks(const BlockTable& table, std::int32_t num_computed_tokens) const {
+        std::int32_t skipped = num_computed_tokens - sliding_window_ + 1;
+        if (skipped <= 0) {
+            return 0;  // all tokens still inside the window
+        }
+        std::int32_t skipped_blocks = skipped / block_size_;  // only fully-slid-out pages
+        // Safety cap: FSM-consistent input never engages it.
+        return std::min(skipped_blocks, table.NumBlocks());
+    }
+
+    auto slidOutRealSlots(const BlockTable& table, std::int32_t num_computed_tokens) const {
+        const std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
+        return std::views::iota(0, skipped_blocks) | std::views::reverse |
+               std::views::take_while([&table](std::int32_t slot) { return !table.Blocks()[slot]->IsNull(); });
+    }
+
+public:
     // Punches null holes so the table never shrinks (keeps slot alignment); reverse-collect evicts FIFO.
     void ReclaimExpired(BlockPool& pool, BlockTable& table, std::int32_t num_computed_tokens) override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
         std::vector<CacheBlock*> freed;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlock* old = table.EvictToNull(i, pool.NullBlock());
-            if (old == nullptr) {
-                break;  // already null -> earlier slots are null too
-            }
-            freed.push_back(old);
+        for (std::int32_t slot : slidOutRealSlots(table, num_computed_tokens)) {
+            freed.push_back(table.EvictToNull(slot, pool.NullBlock()));
         }
         pool.FreeBlocks(freed);
     }
@@ -93,18 +108,11 @@ public:
     // Only blocks whose last reference is this table (RefCount()==1) reach the free list, so shared ones don't count.
     std::int32_t BlocksReclaimableAt(const BlockTable& table, std::int32_t num_computed_tokens,
                                      bool count_uncached) const override {
-        std::int32_t skipped_blocks = fullySlidOutBlocks(table, num_computed_tokens);
-        std::int32_t freed = 0;
-        for (std::int32_t i = skipped_blocks - 1; i >= 0; --i) {
-            CacheBlock* block = table.Blocks()[i];
-            if (block->IsNull()) {
-                break;  // already null -> earlier slots are null too
-            }
-            if (block->RefCount() == 1 && (count_uncached || block->IsCached())) {
-                ++freed;
-            }
-        }
-        return freed;
+        return static_cast<std::int32_t>(
+            std::ranges::count_if(slidOutRealSlots(table, num_computed_tokens), [&](std::int32_t slot) {
+                const CacheBlock* block = table.Blocks()[slot];
+                return block->RefCount() == 1 && (count_uncached || block->IsCached());
+            }));
     }
 
 private:
@@ -137,17 +145,6 @@ private:
             boundary = hits_begin - 1;
         }
         return {begin_blocks, begin_blocks};
-    }
-
-    // Pages [0, result) fully slid out: the next query reads keys [num_computed - window + 1, num_computed].
-    std::int32_t fullySlidOutBlocks(const BlockTable& table, std::int32_t num_computed_tokens) const {
-        std::int32_t skipped = num_computed_tokens - sliding_window_ + 1;
-        if (skipped <= 0) {
-            return 0;  // all tokens still inside the window
-        }
-        std::int32_t skipped_blocks = skipped / block_size_;  // only fully-slid-out pages
-        // Safety cap: FSM-consistent input never engages it.
-        return std::min(skipped_blocks, table.NumBlocks());
     }
 
     std::int32_t sliding_window_;

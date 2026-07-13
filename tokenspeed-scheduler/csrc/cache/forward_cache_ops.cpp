@@ -40,26 +40,31 @@ std::vector<std::pair<CacheBlock*, CacheBlock*>> LoadHostExtension(KvCacheCoordi
 bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                   std::span<const std::string> content_hashes, std::int32_t num_tokens,
                   std::int32_t num_computed_tokens) {
-    return DecodeStep(coordinator, tables, content_hashes, /*first_page_slot=*/0, num_tokens, num_computed_tokens);
+    return DecodeStep(coordinator, tables, content_hashes, /*first_base_block=*/0, num_tokens, num_computed_tokens);
 }
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                std::span<const std::string> content_hashes, std::int32_t first_page_slot, std::int32_t num_tokens,
-                std::int32_t num_computed_tokens) {
+                std::span<const std::string> content_hashes, std::int32_t first_base_block, std::int32_t num_tokens,
+                std::int32_t num_computed_tokens, std::int32_t decode_width) {
     // CacheFullBlocks before ReclaimExpired: registration skips null holes, so
     // the reverse order would lose the punched pages' hashes forever.
     // ReclaimExpired before Acquire: the slide's freed pages fund this chunk
     // (admission gates credit them via BlocksReclaimableAt in lockstep).
-    // num_computed_tokens is the chunk end: state groups register only its aligned final page.
-    coordinator.CacheFullBlocks(tables, content_hashes, first_page_slot, num_computed_tokens);
+    // num_computed_tokens is the chunk end: state groups register every complete emitted snapshot below it.
+    coordinator.CacheFullBlocks(tables, content_hashes, first_base_block, num_computed_tokens);
     coordinator.ReclaimExpired(tables, num_computed_tokens);
-    return coordinator.Acquire(tables, num_tokens);
+    return coordinator.Acquire(tables, num_tokens, decode_width);
 }
 
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
-                                     std::int32_t num_computed_tokens) {
-    return PrefillChunk(coordinator, tables, content_hashes, reserve_tokens, num_computed_tokens);
+                                     std::int32_t registration_end_tokens, std::int32_t decode_width) {
+    // KV and recurrent State were both computed through registration_end_tokens. Unlike KV,
+    // recurrent State must retain an earlier snapshot: the page that supplies the pending
+    // first decode's input State.
+    coordinator.CacheFullBlocks(tables, content_hashes, /*first_base_block=*/0, registration_end_tokens);
+    coordinator.ReclaimExpiredForFirstDecode(tables, registration_end_tokens, decode_width);
+    return coordinator.Acquire(tables, reserve_tokens, decode_width);
 }
 
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {

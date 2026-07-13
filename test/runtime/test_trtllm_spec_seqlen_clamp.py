@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.trtllm import (
     TRTLLMMHAAttnBackend,
 )
@@ -57,6 +58,73 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         is_draft=is_draft,
     )
     return TRTLLMMHAAttnBackend(cfg)
+
+
+def _make_backend_with_page_size(page_size: int) -> TRTLLMMHAAttnBackend:
+    cfg = MHAConfig(
+        device="cpu",
+        backend_name="trtllm",
+        num_attention_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        attn_tp_size=1,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=page_size,
+        context_len=4096,
+        max_bs=8,
+        max_graph_bs=8,
+        kv_cache_quant_method="none",
+    )
+    return TRTLLMMHAAttnBackend(cfg)
+
+
+def test_trtllm_uses_64_token_logical_pages_for_256_token_storage():
+    """A physical P=256 table must address four TRTLLM P=64 pages."""
+    be = _make_backend_with_page_size(256)
+    physical = torch.tensor([[0, 3, 7, -1]], dtype=torch.int32)
+
+    logical = be._kernel_page_table(physical)
+
+    assert logical.tolist() == [
+        [0, 0, 0, 0, 12, 13, 14, 15, 28, 29, 30, 31, 0, 0, 0, 0]
+    ]
+
+
+def test_trtllm_keeps_existing_64_token_tables_unchanged():
+    """The compatibility transform must be a no-op for the normal P=64 path."""
+    be = _make_backend_with_page_size(64)
+    physical = torch.tensor([[0, 3, -1]], dtype=torch.int32)
+
+    logical = be._kernel_page_table(physical)
+
+    assert logical.data_ptr() == physical.data_ptr()
+    assert torch.equal(logical, physical)
+
+
+def test_flashinfer_auto_trtllm_uses_64_token_logical_pages():
+    """The generic FlashInfer backend must apply the same page adaptation."""
+    cfg = MHAConfig(
+        device="cpu",
+        backend_name="flashinfer",
+        num_attention_heads=8,
+        num_kv_heads=8,
+        head_dim=128,
+        attn_tp_size=1,
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        page_size=256,
+        context_len=4096,
+        max_bs=8,
+        max_graph_bs=8,
+        kv_cache_quant_method="none",
+    )
+    be = MHAAttnBackend(cfg)
+    physical = torch.tensor([[0, 3]], dtype=torch.int32)
+
+    logical = be._kernel_page_table(physical)
+
+    assert logical.tolist() == [[0, 0, 0, 0, 12, 13, 14, 15]]
 
 
 def _req_to_page(req_pool_size: int, max_pages: int) -> torch.Tensor:

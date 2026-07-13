@@ -39,6 +39,9 @@ from tokenspeed.runtime.cache.executor.memory_executor import (
     MemoryExecutorConfig,
 )
 from tokenspeed.runtime.cache.transfer.types import CacheKind
+from tokenspeed.runtime.configs.flat_memory_plan import (
+    apply_flat_state_capacity_graph_gate,
+)
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     scheduler_ext_flat_kvcache,
@@ -235,6 +238,17 @@ class EventLoop:
             num_total_pages=num_total_pages,
             overlap_schedule_depth=self.overlap_schedule_depth,
         )
+        graph_cap = apply_flat_state_capacity_graph_gate(
+            model_executor_config, token_to_kv_pool.flat_state_capacity
+        )
+        if graph_cap is not None and graph_cap[1] < graph_cap[0]:
+            logger.info(
+                "Flat State capacity reduces max_cudagraph_capture_size "
+                "from %d to %d; C++ scheduler max_batch_size remains %d",
+                graph_cap[0],
+                graph_cap[1],
+                per_rank_max_batch,
+            )
         self.model_executor = create_model_executor(
             server_args=server_args,
             config=model_executor_config,

@@ -59,6 +59,12 @@ logger = get_colorful_logger(__name__)
 # Workspace buffer shared across all trtllm_mha wrappers.
 _global_workspace_buffer: torch.Tensor | None = None
 TRTLLM_MHA_WORKSPACE = 512 * 1024 * 1024
+# The SM100 TRTLLM decode/context kernels shipped with the current
+# FlashInfer build only provide the P=64 specialization.  The scheduler may
+# use larger physical pages (P=256 for flat GDN), so expose those pages as
+# four logical 64-token pages to the attention kernel.  The underlying KV
+# storage and write locations remain on the scheduler's physical grid.
+TRTLLM_KERNEL_PAGE_SIZE = 64
 
 
 def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
@@ -134,6 +140,12 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
         super().__init__(config)
 
         self.page_size = config.page_size
+        if self.page_size % TRTLLM_KERNEL_PAGE_SIZE != 0:
+            raise ValueError(
+                "TRTLLM attention page size must be a multiple of "
+                f"{TRTLLM_KERNEL_PAGE_SIZE}, got {self.page_size}"
+            )
+        self.kernel_page_ratio = self.page_size // TRTLLM_KERNEL_PAGE_SIZE
         self.max_context_len = config.context_len
         self.kv_cache_dtype = config.kv_cache_dtype
         max_bs = config.max_bs
@@ -216,13 +228,13 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
     # ------------------------------------------------------------------
 
     def _get_kv_cache_permuted(self, layer: PagedAttention, token_to_kv_pool):
-        """Get KV cache in [num_pages, num_kv_heads, page_size, head_dim] layout."""
+        """Get KV cache in the logical page layout expected by TRTLLM."""
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(
-            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            -1, TRTLLM_KERNEL_PAGE_SIZE, layer.tp_k_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
         v_cache = v_cache.view(
-            -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            -1, TRTLLM_KERNEL_PAGE_SIZE, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
 
         if layer.tp_k_head_num == 1:
@@ -231,6 +243,26 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             v_cache = canonicalize_stride(v_cache)
 
         return k_cache, v_cache
+
+    def _kernel_page_table(self, page_table: torch.Tensor) -> torch.Tensor:
+        """Expand physical P pages into logical 64-token TRTLLM pages."""
+        if self.kernel_page_ratio == 1:
+            return page_table
+        # Null/tail entries stay null; multiplying -1 would create invalid
+        # page ids even though tails should not be read by the kernel.
+        valid = page_table > 0
+        base = torch.where(
+            valid, page_table * self.kernel_page_ratio, page_table.new_zeros(())
+        )
+        offsets = torch.arange(
+            self.kernel_page_ratio, dtype=page_table.dtype, device=page_table.device
+        )
+        logical = base.unsqueeze(-1) + offsets
+        logical = torch.where(valid.unsqueeze(-1), logical, page_table.new_zeros(()))
+        return logical.reshape(page_table.shape[0], -1)
+
+    def _select_kernel_page_table(self, layer, metadata):
+        return self._kernel_page_table(self._select_page_table(layer, metadata))
 
     def _compute_scales(self, layer: PagedAttention):
         """Compute bmm1/bmm2 scales for the fused kernel."""
@@ -327,7 +359,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             query=q,
             kv_cache=(k_cache, v_cache),
             workspace_buffer=self.workspace_buffer,
-            block_tables=self._select_page_table(layer, metadata),
+            block_tables=self._select_kernel_page_table(layer, metadata),
             seq_lens=metadata.cache_seqlens_int32,
             max_seq_len=self.max_context_len,
             bmm1_scale=bmm1_scale,
@@ -367,7 +399,7 @@ class TRTLLMMHAAttnBackend(FlatCacheGroupsMixin, AttentionBackend):
             query=q,
             kv_cache=(k_cache, v_cache),
             workspace_buffer=self.workspace_buffer,
-            block_tables=self._select_page_table(layer, metadata),
+            block_tables=self._select_kernel_page_table(layer, metadata),
             seq_lens=metadata.cache_seqlens_int32,
             max_q_len=metadata.max_seq_len_q,
             max_kv_len=self.max_context_len,

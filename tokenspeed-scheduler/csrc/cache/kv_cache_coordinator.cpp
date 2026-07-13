@@ -50,16 +50,24 @@ KvCacheCoordinator::KvCacheCoordinator(std::vector<CacheGroup> groups, BlockPool
             match_order_.push_back(i);
         }
     }
+    for (const CacheGroup& group : groups_) {
+        requires_aligned_prefill_chunks_ |= group.Manager().RequiresAlignedPrefillChunks();
+    }
 }
 
 std::vector<std::string> KvCacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
                                                           std::uint32_t group_id, std::int32_t group_block_size,
                                                           std::int32_t first_base) const {
-    const std::int32_t m = group_block_size / base_block_size_;
-    return MakeFoldedGroupKeys(content_hashes, group_id, m, first_base);
+    const std::int32_t fold_factor = group_block_size / base_block_size_;
+    return MakeFoldedGroupKeys(content_hashes, group_id, fold_factor, first_base);
 }
 
 namespace {
+
+std::int32_t SpeculativeStateTarget(std::int32_t decode_width) {
+    _assert(decode_width >= 0, "speculative decode width must be >= 0");
+    return decode_width > 1 ? decode_width : 0;
+}
 
 // Shared match skeleton: one ordered sweep (closed groups first), then re-match any window
 // group left above the settled bound -- with 2+ window groups a later group can shrink the
@@ -188,74 +196,82 @@ std::vector<std::pair<CacheBlock*, CacheBlock*>> KvCacheCoordinator::LoadHostExt
 std::int32_t KvCacheCoordinator::BlocksConsumedByClaim(const CoordinatorMatch& hit) const {
     std::int32_t consumed = 0;
     for (const PrefixMatch& match : hit.per_group) {
-        for (const CacheBlock* block : match.blocks) {
-            if (!block->IsNull() && block->RefCount() == 0) {
-                ++consumed;
-            }
-        }
+        consumed += static_cast<std::int32_t>(std::ranges::count_if(
+            match.blocks, [](const CacheBlock* block) { return !block->IsNull() && block->RefCount() == 0; }));
     }
     return consumed;
 }
 
-std::int32_t KvCacheCoordinator::BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const {
+std::int32_t KvCacheCoordinator::BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                                 std::int32_t decode_width) const {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    const std::int32_t target_speculative_blocks = SpeculativeStateTarget(decode_width);
     std::int32_t total_needed = 0;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         total_needed += groups_[i].Manager().BlocksNeededFor(tables[i], num_tokens);
+        total_needed += groups_[i].Manager().SpeculativeBlocksNeededFor(tables[i], target_speculative_blocks);
     }
     return total_needed;
 }
 
-std::int32_t KvCacheCoordinator::BlocksNeededFor(std::int32_t num_tokens) const {
+std::int32_t KvCacheCoordinator::BlocksNeededFor(std::int32_t num_tokens, std::int32_t decode_width) const {
     const BlockTable fresh;
+    const std::int32_t target_speculative_blocks = SpeculativeStateTarget(decode_width);
     std::int32_t total_needed = 0;
     for (const CacheGroup& group : groups_) {
         total_needed += group.Manager().BlocksNeededFor(fresh, num_tokens);
+        total_needed += group.Manager().SpeculativeBlocksNeededFor(fresh, target_speculative_blocks);
     }
     return total_needed;
 }
 
 bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_tokens) {
+    return Acquire(tables, num_tokens, /*decode_width=*/0);
+}
+
+bool KvCacheCoordinator::Acquire(std::span<BlockTable> tables, std::int32_t num_tokens, std::int32_t decode_width) {
     // Check-then-act: no group is ever left in a partial/unaligned state.
-    if (BlocksNeededFor(tables, num_tokens) > pool_.NumFreeBlocks()) {
+    if (BlocksNeededFor(tables, num_tokens, decode_width) > pool_.NumFreeBlocks()) {
         return false;
     }
+    const std::int32_t target_speculative_blocks = SpeculativeStateTarget(decode_width);
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const bool acquired = groups_[i].Manager().Acquire(pool_, tables[i], num_tokens);
         _assert(acquired, "pre-checked Acquire must succeed");
+    }
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        const bool acquired =
+            groups_[i].Manager().AcquireSpeculativeBlocks(pool_, tables[i], target_speculative_blocks);
+        _assert(acquired, "pre-checked speculative State Acquire must succeed");
     }
     return true;
 }
 
 void KvCacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                                         std::int32_t first_slot, std::int32_t end_tokens) {
+                                         std::int32_t first_base_block, std::int32_t end_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const std::int32_t group_block_size = groups_[i].Spec().block_size;
-        const std::int32_t m = group_block_size / base_block_size_;
-        // The first coarse block sits at table slot ceil(first_slot / m): the first grid-aligned
-        // block fully inside the range (fold drops any leading remainder).
+        const std::int32_t fold_factor = group_block_size / base_block_size_;
         std::vector<std::string> keys =
-            keysForGroup(content_hashes, groups_[i].GroupId(), group_block_size, /*first_base=*/first_slot);
-        std::int32_t group_first_slot = (first_slot + m - 1) / m;
+            keysForGroup(content_hashes, groups_[i].GroupId(), group_block_size, /*first_base=*/first_base_block);
+        std::int32_t group_first_block = (first_base_block + fold_factor - 1) / fold_factor;
         std::span<const std::string> group_keys = keys;
-        if (groups_[i].Manager().RegistersAlignedFinalPageOnly()) {
-            // Interior boundaries never received a state write; only an aligned chunk end holds a
-            // real snapshot, in the final full coarse block.
-            if (end_tokens < 0 || end_tokens % group_block_size != 0 || keys.empty()) {
+        if (groups_[i].Manager().CachesAlignedStateSnapshots()) {
+            // Every interior P boundary holds a real snapshot. Register all complete coarse
+            // blocks below the absolute end; an unaligned tail is intentionally left uncached.
+            if (end_tokens < 0 || keys.empty()) {
                 continue;
             }
-            const std::int32_t past_end_slot = group_first_slot + static_cast<std::int32_t>(keys.size());
-            group_first_slot = past_end_slot - 1;
-            group_keys = group_keys.last(1);
-            const bool aligned_range = past_end_slot == end_tokens / group_block_size;
+            const std::int32_t group_past_end_block = group_first_block + static_cast<std::int32_t>(keys.size());
+            const bool aligned_range = group_past_end_block == end_tokens / group_block_size;
             _assert(aligned_range, "state registration range must end at the aligned boundary");
         }
         std::vector<std::pair<std::string, CacheBlock*>> newly_cached;
-        groups_[i].Manager().CacheFullBlocks(pool_, tables[i], group_keys, group_first_slot,
+        groups_[i].Manager().CacheFullBlocks(pool_, tables[i], group_keys, group_first_block,
                                              host_pool_ != nullptr ? &newly_cached : nullptr);
         for (auto& [key, block] : newly_cached) {
             pending_stores_.push_back(StoreCandidate{std::move(key), BlockRef::Share(pool_, block)});
@@ -267,6 +283,16 @@ void KvCacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         groups_[i].Manager().ReclaimExpired(pool_, tables[i], num_computed_tokens);
+    }
+}
+
+void KvCacheCoordinator::ReclaimExpiredForFirstDecode(std::span<BlockTable> tables, std::int32_t prefill_end_tokens,
+                                                      std::int32_t decode_input_tokens) {
+    _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        KvCacheManager& manager = groups_[i].Manager();
+        const std::int32_t boundary = manager.SafeReclaimBoundary(prefill_end_tokens, decode_input_tokens);
+        manager.ReclaimExpired(pool_, tables[i], boundary);
     }
 }
 

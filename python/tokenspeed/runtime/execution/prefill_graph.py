@@ -235,21 +235,7 @@ class PrefillGraph:
         self.dp_size = config.data_parallel_size
 
         self.capture_buckets = get_prefill_token_buckets(config)
-        self.disable = (
-            config.enforce_eager
-            or config.disable_prefill_graph
-            or not self.capture_buckets
-            or self.inner_model is None
-            or self._embed_tokens is None
-            or model_runner is None
-            or not model_runner.is_generation
-            # DP replay decisions must come from replicated state, and a
-            # forward's multimodal-ness is rank-local: one rank running its mm
-            # prefill eager while text-only peers replay desyncs the EP
-            # collectives. Until the DP metadata gather carries a multimodal
-            # flag, keep the graph off for multimodal models under DP.
-            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
-        )
+        self.disable = self._should_disable(model_runner)
 
         self._ctx: ForwardContext | None = None
         self._pool = None
@@ -262,6 +248,28 @@ class PrefillGraph:
 
         if not self.disable:
             self.capture(decode_wrapper)
+
+    def _should_disable(self, model_runner) -> bool:
+        """Whether to skip prefill-graph capture entirely and run eager.
+
+        Off for eager/explicit-disable configs, when no buckets or model
+        pieces (inner_model / embed_tokens) are available, for non-generation
+        runners, and for multimodal models under DP: DP replay decisions come
+        from replicated state, but a forward's multimodal-ness is rank-local,
+        so one rank running its mm prefill eager while text-only peers replay
+        would desync the EP collectives (until the DP metadata gather carries
+        a multimodal flag)."""
+        config = self.config
+        return (
+            config.enforce_eager
+            or config.disable_prefill_graph
+            or not self.capture_buckets
+            or self.inner_model is None
+            or self._embed_tokens is None
+            or model_runner is None
+            or not model_runner.is_generation
+            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+        )
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -443,18 +451,9 @@ class PrefillGraph:
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [1] * self.config.world_size
-        extra_metadata_kwargs: dict = {}
-        if (
-            getattr(self.attn_backend, "uses_paged_cache_groups", False)
-            and decode_wrapper is not None
-        ):
-            tables = decode_wrapper._capture_paged_cache_block_tables(
-                1, self.token_to_kv_pool
-            )
-            if tables is not None:
-                extra_metadata_kwargs["paged_cache_block_tables"] = tables
-            extra_metadata_kwargs["num_tokens"] = num_tokens
-            extra_metadata_kwargs["positions"] = ib.positions_buf[:num_tokens]
+        extra_metadata_kwargs = self._dummy_cache_group_kwargs(
+            decode_wrapper, num_tokens
+        )
         self.attn_backend.init_forward_metadata(
             bs=1,
             num_extends=1,
@@ -469,6 +468,42 @@ class PrefillGraph:
             **extra_metadata_kwargs,
         )
         return ctx
+
+    def _dummy_cache_group_kwargs(self, decode_wrapper, num_tokens: int) -> dict:
+        """Per-group cache-table kwargs for the dummy capture batch.
+
+        Both paged- and flat-cache backends index per-group block tables at
+        metadata init; an extend capture without them raises and degrades the
+        whole graph to eager. The tables are all-page-0 (the safe dummy page):
+        GDN/attention run as eager breaks that re-read the LIVE tables at every
+        replay, so these stand-ins serve only the one capture-time eager pass
+        (its output is discarded). The decode capture builder sizes each
+        published group (full + k state shards) wide enough that the state slot
+        math never overruns.
+        """
+        backend = self.attn_backend
+        if decode_wrapper is None:
+            return {}
+        kwargs: dict = {}
+        if getattr(backend, "uses_paged_cache_groups", False):
+            tables = decode_wrapper._capture_paged_cache_block_tables(
+                1, self.token_to_kv_pool
+            )
+            if tables is not None:
+                kwargs["paged_cache_block_tables"] = tables
+            kwargs["num_tokens"] = num_tokens
+            kwargs["positions"] = self.input_buffers.positions_buf[:num_tokens]
+        if getattr(backend, "uses_flat_cache_groups", False):
+            flat_tables = decode_wrapper._capture_paged_cache_block_tables(
+                1, self.token_to_kv_pool
+            )
+            if flat_tables is not None:
+                kwargs["flat_block_tables"] = flat_tables
+                # State page 0 is a safe dummy slab row for capture, but is not
+                # a valid live allocation. Tell the State gather to skip only
+                # its allocation assertions for this explicit placeholder.
+                kwargs["flat_state_capture_placeholder"] = True
+        return kwargs
 
     def _capture_unanimous(self, captured_ok: bool) -> bool:
         """MIN-reduce capture success across the world (see ``capture``)."""

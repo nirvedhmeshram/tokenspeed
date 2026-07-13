@@ -133,14 +133,15 @@ private:
         std::vector<std::string> ext_hashes;
     };
     FlatAdmissionMatch matchFlatPrefixAtAdmission(Request* request);
-    std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
-                                                    std::int32_t ext_real_pages, std::int32_t chunk_tokens,
-                                                    std::int32_t decode_reserve_tokens) const;
-    std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
-                                                      std::int32_t decode_reserve_tokens,
-                                                      std::int32_t num_computed_tokens) const;
-    bool flatAdmitDecode(Request* request) const;
-    bool flatPoolWedged(const std::vector<Request*>& candidates) const;
+    [[nodiscard]] std::optional<std::int32_t> flatAdmitFirstChunk(Request* request, const CoordinatorMatch& hit,
+                                                                  std::int32_t ext_real_pages,
+                                                                  std::int32_t chunk_tokens,
+                                                                  std::int32_t decode_reserve_tokens) const;
+    [[nodiscard]] std::optional<std::int32_t> flatAdmitPrefillChunk(Request* request, std::int32_t chunk_tokens,
+                                                                    std::int32_t decode_reserve_tokens,
+                                                                    std::int32_t num_computed_tokens) const;
+    [[nodiscard]] bool flatAdmitDecode(Request* request) const;
+    [[nodiscard]] bool flatPoolWedged(const std::vector<Request*>& candidates) const;
     void resolveFlatStarvation(const std::vector<Request*>& candidates, bool made_progress);
 #endif
 
@@ -174,6 +175,15 @@ private:
 #endif
     }
 
+    const std::map<std::string, std::int32_t>& FlatStateGroupBlockSizes() const {
+#if TOKENSPEED_FLAT_KVCACHE
+        return flat_state_group_block_sizes_;
+#else
+        static const std::map<std::string, std::int32_t> empty;
+        return empty;
+#endif
+    }
+
 private:
     SchedulerConfig config_;
 
@@ -193,6 +203,7 @@ private:
     BlockPool flat_host_pool_;
     KvCacheCoordinator coordinator_;
     std::vector<std::string> flat_group_ids_;  // group_id per cache group, index-aligned to coordinator groups
+    std::map<std::string, std::int32_t> flat_state_group_block_sizes_;
     // ExtendResults the executor still owes per request (erased on Finish/Abort/PD-success); non-empty means
     // an in-flight forward can still free pool pages, which flatPoolWedged keys off.
     std::unordered_map<std::string, std::int32_t> pending_forward_results_;

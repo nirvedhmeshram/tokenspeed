@@ -30,6 +30,7 @@ from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
+    from tokenspeed.runtime.configs.flat_memory_plan import FlatStateCapacity
 
 logger = get_colorful_logger(__name__)
 
@@ -40,6 +41,7 @@ class BaseTokenToKVPool:
     paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = ()
     paged_cache_group_page_counts: dict[str, int] = {}
     supports_hierarchical_kv_cache: bool = True
+    flat_state_capacity: FlatStateCapacity | None
 
     def __init__(
         self,
@@ -63,6 +65,7 @@ class BaseTokenToKVPool:
         self.device = device
         self.offload_chunk_page_num = 1024
         self.token_slot_refs = None
+        self.flat_state_capacity = None
 
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
@@ -83,6 +86,12 @@ class BaseTokenToKVPool:
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         """Optional hook for model-specific paged-cache diagnostics."""
         return None
+
+    def publish_flat_state_capacity(self, capacity: FlatStateCapacity) -> None:
+        """Publish the immutable Flat-State capacity result exactly once."""
+        if self.flat_state_capacity is not None:
+            raise RuntimeError("Flat State capacity was already published")
+        self.flat_state_capacity = capacity
 
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:

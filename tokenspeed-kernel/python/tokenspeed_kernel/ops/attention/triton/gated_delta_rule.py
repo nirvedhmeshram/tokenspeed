@@ -62,7 +62,10 @@ def triton_gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    checkpoint_interval: int | None = None,
 ) -> GdnChunkPrefillResult:
+    # FLA ``h`` checkpoints stay on the fixed 64-token grid regardless.
+    del checkpoint_interval
     result = chunk_gated_delta_rule(
         q=q,
         k=k,

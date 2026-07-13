@@ -93,6 +93,7 @@ def gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    checkpoint_interval: int | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> GdnChunkPrefillResult:
@@ -111,6 +112,10 @@ def gdn_chunk_prefill(
         output_final_state: Whether to return the final recurrent state.
         output_h: Whether to return intermediate recurrent checkpoints in the
             selected backend's native layout.
+        checkpoint_interval: Token stride between checkpoints when
+            ``output_h=True`` (``None`` -> the backend default of 64). Only
+            the FLASHINFER layout honors it; the FLA ``h`` workspace stays on
+            its fixed 64-token grid.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -175,6 +180,7 @@ def gdn_chunk_prefill(
             qk_l2norm=qk_l2norm,
             output_final_state=output_final_state,
             output_h=output_h,
+            checkpoint_interval=checkpoint_interval,
         )
 
 

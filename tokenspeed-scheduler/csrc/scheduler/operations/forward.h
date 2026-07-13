@@ -59,6 +59,13 @@ struct ForwardOperationBase {
     // compacted). Filled only on the flat path; empty on the radix path. Does
     // not share a contract with paged_cache_pages (radix: compact + offset).
     std::map<std::string, std::vector<std::int32_t>> flat_block_tables;
+    // Resolved recurrent-state pages for flat execution; empty on radix.
+    // Out pages carry one entry per verify position (single-element on plain decode).
+    std::map<std::string, std::int32_t> flat_state_in_pages;
+    std::map<std::string, std::vector<std::int32_t>> flat_state_out_pages;
+    // Request-owned State destinations for speculative verify positions. Real
+    // rows contain distinct positive physical page ids; empty outside target decode.
+    std::map<std::string, std::vector<std::int32_t>> flat_state_spec_pages;
 
     // Mamba extension (default: inactive)
     std::int32_t mamba_working_idx{-1};
@@ -119,6 +126,11 @@ struct FlatForwardOperation {
     // [num_reqs, max_pages_in_batch] padded with -1. Each row is absolute
     // (null hole = 0, no compaction); there is no base-offset companion.
     std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_block_tables;
+    // Per-request recurrent-state pages, ordered like request_ids. In pages are
+    // one per request; out/spec pages are [num_reqs, max_verify_positions] padded -1.
+    std::map<std::string, std::vector<std::int32_t>> flat_state_in_pages;
+    std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_state_out_pages;
+    std::map<std::string, std::vector<std::vector<std::int32_t>>> flat_state_spec_pages;
 
     explicit FlatForwardOperation(std::vector<ForwardOperation> ops) {
         std::stable_partition(ops.begin(), ops.end(),
@@ -143,6 +155,15 @@ struct FlatForwardOperation {
                     for (auto& [gid, pages] : inner.flat_block_tables) {
                         flat_block_tables[gid];
                     }
+                    for (auto& [gid, _] : inner.flat_state_in_pages) {
+                        flat_state_in_pages[gid];
+                    }
+                    for (auto& [gid, _] : inner.flat_state_out_pages) {
+                        flat_state_out_pages[gid];
+                    }
+                    for (auto& [gid, _] : inner.flat_state_spec_pages) {
+                        flat_state_spec_pages[gid];
+                    }
                     for (auto& [gid, _] : inner.paged_cache_page_base_offsets) {
                         paged_cache_block_table_base_offsets[gid];
                     }
@@ -165,6 +186,15 @@ struct FlatForwardOperation {
         for (auto& [_, table] : flat_block_tables) {
             table.assign(num_reqs, std::vector<std::int32_t>{});
         }
+        for (auto& [_, pages] : flat_state_in_pages) {
+            pages.assign(num_reqs, -1);
+        }
+        for (auto& [_, pages] : flat_state_out_pages) {
+            pages.assign(num_reqs, std::vector<std::int32_t>{});
+        }
+        for (auto& [_, pages] : flat_state_spec_pages) {
+            pages.assign(num_reqs, std::vector<std::int32_t>{});
+        }
         for (auto& [_, offsets] : paged_cache_block_table_base_offsets) {
             offsets.assign(num_reqs, 0);
         }
@@ -178,6 +208,15 @@ struct FlatForwardOperation {
                     for (auto& [gid, pages] : inner.flat_block_tables) {
                         flat_block_tables[gid][row] = std::move(pages);
                     }
+                    for (auto& [gid, page] : inner.flat_state_in_pages) {
+                        flat_state_in_pages[gid][row] = page;
+                    }
+                    for (auto& [gid, pages] : inner.flat_state_out_pages) {
+                        flat_state_out_pages[gid][row] = std::move(pages);
+                    }
+                    for (auto& [gid, pages] : inner.flat_state_spec_pages) {
+                        flat_state_spec_pages[gid][row] = std::move(pages);
+                    }
                     for (auto& [gid, off] : inner.paged_cache_page_base_offsets) {
                         paged_cache_block_table_base_offsets[gid][row] = off;
                     }
@@ -187,6 +226,8 @@ struct FlatForwardOperation {
         }
         padRectangularMinusOne(paged_cache_block_tables);
         padRectangularMinusOne(flat_block_tables);
+        padRectangularMinusOne(flat_state_out_pages);
+        padRectangularMinusOne(flat_state_spec_pages);
     }
 
     bool empty() const { return request_ids.empty(); }

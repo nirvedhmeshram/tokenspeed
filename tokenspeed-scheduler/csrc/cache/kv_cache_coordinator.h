@@ -54,6 +54,9 @@ public:
     std::int32_t BaseBlockSize() const { return base_block_size_; }
     std::int32_t LcmBlockSize() const { return lcm_block_size_; }
 
+    // True if any group requires non-final prefill chunks to end on the cache-group LCM grid.
+    bool RequiresAlignedPrefillChunks() const { return requires_aligned_prefill_chunks_; }
+
     KvCacheManager& GroupManager(std::int32_t i) { return groups_[static_cast<std::size_t>(i)].Manager(); }
     const KvCacheManager& GroupManager(std::int32_t i) const { return groups_[static_cast<std::size_t>(i)].Manager(); }
 
@@ -77,19 +80,31 @@ public:
 
     // All-or-nothing across all groups: on shortfall allocates NOTHING and returns false (no rollback needed).
     bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens);
+    // Combined canonical + request-owned speculative State allocation. For a
+    // decode_width > 1, each Mamba State group is grown to that width in the same
+    // prechecked transaction; widths 0/1 add no State segment and other group
+    // kinds never receive one.
+    bool Acquire(std::span<BlockTable> tables, std::int32_t num_tokens,
+                 std::int32_t decode_width);
 
     // Single home of the gate-side page math; Acquire's check and the flat admission gates both build on it.
-    std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens) const;
+    // decode_width is always explicit: pass 0 (or 1) when a step decodes a single token.
+    std::int32_t BlocksNeededFor(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                 std::int32_t decode_width) const;
     // Fresh-table overload for a not-yet-allocated request (no tail credit).
-    std::int32_t BlocksNeededFor(std::int32_t num_tokens) const;
+    std::int32_t BlocksNeededFor(std::int32_t num_tokens, std::int32_t decode_width) const;
 
-    // end_tokens = the chunk's end position (-1 = unknown/legacy): aligned-final-page-only
-    // groups register nothing without it, since only an aligned chunk end holds a real snapshot.
-    // first_slot may reach back to the fold grid (decode re-covers so coarse groups can fold);
-    // registered slots are skipped per slot, so the overlap is idempotent.
+    // end_tokens = the chunk's end position (-1 = unknown/legacy): aligned State groups
+    // register nothing without it, and can register every complete emitted snapshot below it.
+    // first_base_block is a base-granular block index; it may reach back to the fold grid (decode
+    // re-covers so coarse groups can fold). Already-registered blocks are skipped, so overlap is idempotent.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::int32_t first_slot = 0, std::int32_t end_tokens = -1);
+                         std::int32_t first_base_block = 0, std::int32_t end_tokens = -1);
     void ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens);
+    // Every group has computed through prefill_end_tokens. Recurrent State groups may retain an
+    // earlier snapshot: the page that supplies the pending decode's input State (decode_input_tokens back).
+    void ReclaimExpiredForFirstDecode(std::span<BlockTable> tables, std::int32_t prefill_end_tokens,
+                                      std::int32_t decode_input_tokens);
     void Free(std::span<BlockTable> tables);
 
     struct StoreCandidate {
@@ -117,6 +132,7 @@ private:
     const BlockPool* host_pool_{nullptr};
     std::int32_t base_block_size_{0};
     std::int32_t lcm_block_size_{0};
+    bool requires_aligned_prefill_chunks_{false};
     std::vector<StoreCandidate> pending_stores_;
 };
 

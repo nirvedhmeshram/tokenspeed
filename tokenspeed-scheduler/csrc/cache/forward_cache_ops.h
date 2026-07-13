@@ -59,12 +59,12 @@ bool PrefillChunk(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tabl
                   std::int32_t num_computed_tokens);
 
 bool DecodeStep(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
-                std::span<const std::string> content_hashes, std::int32_t first_page_slot, std::int32_t num_tokens,
-                std::int32_t num_computed_tokens);
+                std::span<const std::string> content_hashes, std::int32_t first_base_block, std::int32_t num_tokens,
+                std::int32_t num_computed_tokens, std::int32_t decode_width = 0);
 
 bool FinalizePrefillAndReserveDecode(KvCacheCoordinator& coordinator, std::vector<BlockTable>& tables,
                                      std::span<const std::string> content_hashes, std::int32_t reserve_tokens,
-                                     std::int32_t num_computed_tokens);
+                                     std::int32_t registration_end_tokens, std::int32_t decode_width = 0);
 
 // One KvCacheSpec per config paged_cache_group (group_id = index); all groups share config.block_size.
 std::vector<KvCacheSpec> MakeSpecsFromConfig(const SchedulerConfig& config);

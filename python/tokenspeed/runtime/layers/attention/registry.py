@@ -21,12 +21,15 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
+    STATE_LAYER_TYPES,
     components_from_layers,
-    equalized_block_size,
+    flat_state_capacity_from_plan,
     plan_component_tensors,
+    shard_bin_table,
     state_const_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
@@ -413,32 +416,38 @@ def create_attn_components(
 
     config = _create_attn_config(server_args, model_config)
     is_flat_gdn = getattr(config, "conv_state_shape", None) is not None
-    gdn_state_bytes = (
-        state_const_bytes(
-            config.conv_state_shape,
-            config.conv_dtype,
-            config.temporal_state_shape,
-            config.ssm_dtype,
-        )
-        if is_flat_gdn
-        else None
-    )
+    state_bin_table = None
     if is_flat_gdn:
-        equalized_block_size_value = equalized_block_size(
-            layer_types=list(config.layer_types),
-            kv_bytes_per_slot=config.cache_cell_size(),
-            state_const_bytes=gdn_state_bytes,
+        if server_args.block_size % 64 != 0:
+            raise ValueError(
+                "flat GDN requires block_size to be a multiple of 64, got "
+                f"{server_args.block_size}; set server_args.block_size to a "
+                "multiple of 64 (e.g. 128 or 256)"
+            )
+        state_bin_table = shard_bin_table(
+            num_full_layers=sum(
+                1 for t in config.layer_types if t not in STATE_LAYER_TYPES
+            ),
+            num_state_layers=sum(
+                1 for t in config.layer_types if t in STATE_LAYER_TYPES
+            ),
+            ssm_heads_per_layer=config.temporal_state_shape[0],
+            ssm_head_bytes=(
+                config.temporal_state_shape[1]
+                * config.temporal_state_shape[2]
+                * config.ssm_dtype.itemsize
+            ),
+            conv_bytes_per_layer=math.prod(config.conv_state_shape)
+            * config.conv_dtype.itemsize,
+            kv_cell_bytes_per_tok=config.cache_cell_size(),
             block_size=server_args.block_size,
         )
-        if equalized_block_size_value != server_args.block_size:
-            logger.info(
-                "Setting attention block size to %d tokens to cover the GDN "
-                "state row (configured block size %d)",
-                equalized_block_size_value,
-                server_args.block_size,
-            )
-            server_args.block_size = equalized_block_size_value
-            config.page_size = equalized_block_size_value
+        config.state_bin_table = state_bin_table
+        logger.info(
+            "Flat GDN: block_size=%d kept (no equalizer), state shards k=%d",
+            server_args.block_size,
+            state_bin_table.num_shards,
+        )
     draft_attn_config = None
     if draft_model_config:
         draft_attn_config = _create_attn_config(
@@ -510,6 +519,7 @@ def create_attn_components(
     )
     mamba_pool_total_chunks = 0
     mamba_pool = None
+    flat_plan = None
 
     _profile_kwargs = dict(
         attn_config=config,
@@ -585,10 +595,13 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
         flat_plan = plan_component_tensors(
+            # State is aliased over the full layers' rows (state binning): not charged
+            # per block. An empty state_const_bytes makes state layers
+            # contribute no components at all, so no filtering is needed.
             components_from_layers(
                 layer_types=list(config.layer_types),
                 kv_bytes_per_slot=config.cache_cell_size(),
-                state_const_bytes=gdn_state_bytes,
+                state_const_bytes={},
             ),
             block_size=server_args.block_size,
             budget_bytes=cache_memory,
@@ -695,6 +708,32 @@ def create_attn_components(
             f"KV cache token pool size must be positive, got {max_num_tokens}"
         )
 
+    flat_state_capacity = None
+    if flat_plan is not None:
+        assert state_bin_table is not None
+        flat_state_capacity = flat_state_capacity_from_plan(
+            flat_plan,
+            state_bin_table=state_bin_table,
+            verify_width=decode_input_tokens,
+            num_page_ids=max_num_tokens // server_args.block_size,
+        )
+        logger.info(
+            "Flat State capacity: physical_page_bytes=%d, "
+            "logical_state_payload_bytes_per_checkpoint=%d, usable_page_ids=%d, "
+            "state_shards=%d, verify_width=%d, canonical_pages_per_request=%d, "
+            "speculative_pages_per_request=%d, total_state_pages_per_request=%d, "
+            "state_limited_request_concurrency=%d",
+            flat_state_capacity.physical_page_bytes,
+            flat_state_capacity.logical_state_payload_bytes_per_checkpoint,
+            flat_state_capacity.usable_page_ids,
+            flat_state_capacity.state_shard_count,
+            flat_state_capacity.verify_width,
+            flat_state_capacity.canonical_pages_per_request,
+            flat_state_capacity.speculative_pages_per_request,
+            flat_state_capacity.total_state_pages_per_request,
+            flat_state_capacity.state_limited_request_concurrency,
+        )
+
     if is_deepseek_v4_model:
         from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v4 import (
             DeepseekV4TokenToKVPool,
@@ -741,6 +780,8 @@ def create_attn_components(
         pool = _create_attn_pool(
             config, num_layers, max_num_tokens, rank, enable_memory_saver
         )
+    if flat_state_capacity is not None:
+        pool.publish_flat_state_capacity(flat_state_capacity)
     draft_attn_backend = None
     draft_pool = None
     if draft_attn_config:

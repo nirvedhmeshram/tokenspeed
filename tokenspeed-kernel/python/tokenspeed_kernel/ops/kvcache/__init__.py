@@ -19,3 +19,7 @@
 # SOFTWARE.
 
 """KV cache kernel entry points."""
+
+from tokenspeed_kernel.ops.kvcache.triton import flat_mtp_state_commit
+
+__all__ = ["flat_mtp_state_commit"]

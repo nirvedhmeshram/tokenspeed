@@ -224,7 +224,7 @@ std::variant<PrefillDone, Prefilling> SchedulePrefillFirstChunkEvent::operator()
     // re-collects them and the drain dedupes against the host index. The extension ends at the
     // page-aligned hit boundary, so the state group's final page is exactly the loaded snapshot.
     coordinator_->CacheFullBlocks(tables, flat_ext_hashes_,
-                                  /*first_slot=*/flat_hit_.num_common_tokens / state.GetPageSize(),
+                                  /*first_base_block=*/flat_hit_.num_common_tokens / state.GetPageSize(),
                                   /*end_tokens=*/hit_tokens);
     if (!coordinator_->Acquire(tables, tokens_this_round_)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
@@ -398,11 +398,11 @@ Decoding ScheduleDecodeEvent::operator()(PrefillDone&& state) {
     const std::vector<std::string> hashes = FlatWindowPageHashes(state.GetFullPagedTokens(false), state.GetPageSize(),
                                                                  state.window.begin, state.window.size);
     const std::int32_t reserve = state.GetReserveNumTokensInNextScheduleEvent();
-    // Full prefill length (window end == PrefillSize()); the PrefillDone gate credited the same value.
-    const std::int32_t num_computed_tokens = state.window.begin + state.window.size;
+    const std::int32_t registration_end_tokens = state.window.begin + state.window.size;
 
     auto tables = std::move(state).TakeBlockTables();
-    if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, num_computed_tokens)) {
+    if (!FinalizePrefillAndReserveDecode(*coordinator_, tables, hashes, reserve, registration_end_tokens,
+                                         decode_input_tokens_)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
@@ -460,7 +460,8 @@ Decoding ScheduleDecodeEvent::operator()(Decoding&& state) {
     }
 
     auto tables = std::move(state).TakeBlockTables();
-    if (!DecodeStep(*coordinator_, tables, to_register.hashes, to_register.begin_page, reserve, num_computed_tokens)) {
+    if (!DecodeStep(*coordinator_, tables, to_register.hashes, to_register.begin_page, reserve, num_computed_tokens,
+                    decode_input_tokens_)) {
         _assert(false, "flat path: allocation failure unsupported in C slice");
     }
 
