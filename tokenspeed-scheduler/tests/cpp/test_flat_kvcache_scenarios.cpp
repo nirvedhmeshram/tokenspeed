@@ -2981,6 +2981,267 @@ TEST_F(FlatThreeGranularitySuite, DecodeFoldedCoarseBlockHittableAlongsideWindow
 }
 
 // ---------------------------------------------------------------------------
+// M18c state-shard groups -- the GDN "1 full + k state shards" publication
+// shape: one full-history group plus k=4 linear_attention_shard{i} groups
+// (family State, FullHistory retention) at ONE shared block size, so
+// GCD = LCM = P. Every shard rides the M18b machinery unchanged
+// (MambaStateManager(P) = SwaManager(P, 2) + aligned-final-page-only
+// registration) and allocates INDEPENDENTLY: the same snapshot occupies k
+// distinct physical blocks, one per shard group.
+// ---------------------------------------------------------------------------
+class FlatStateShardSuite : public FlatDecodeCachingSuite {
+protected:
+    static constexpr const char* kShardIds[4] = {"linear_attention_shard0", "linear_attention_shard1",
+                                                 "linear_attention_shard2", "linear_attention_shard3"};
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.block_size = 2;
+        cfg.device_allocator.total_pages = TotalPages();
+        cfg.host_allocator.total_pages = TotalPages();
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+
+        cfg.paged_cache_groups = {MakeGroup("full", cfg.block_size, cfg.device_allocator.total_pages,
+                                            PagedCacheGroupConfig::Retention::FullHistory,
+                                            PagedCacheGroupFamily::History)};
+        for (const char* shard_id : kShardIds) {
+            cfg.paged_cache_groups.push_back(MakeGroup(shard_id, cfg.block_size, cfg.device_allocator.total_pages,
+                                                       PagedCacheGroupConfig::Retention::FullHistory,
+                                                       PagedCacheGroupFamily::State));
+        }
+        return cfg;
+    }
+};
+
+TEST_F(FlatStateShardSuite, SnapshotHitAcrossKShards) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    // r1: 8 aligned tokens = 4 blocks in every group. The finalize (N=8,
+    // aligned) registers full pages 0..3 but per shard ONLY the slot-3
+    // snapshot; finish frees everything hash-intact.
+    const auto r1_rows = RunLifecycle(MakeRequestSpec("r1", /*num_pages=*/4));
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "r1 must fully reclaim before r2 runs";
+    ASSERT_EQ(r1_rows.at("full").size(), 4u);
+    std::set<std::int32_t> snapshot_ids;
+    for (const char* shard_id : kShardIds) {
+        ASSERT_EQ(r1_rows.at(shard_id).size(), 4u) << shard_id;
+        ASSERT_GT(r1_rows.at(shard_id)[3], 0) << shard_id;
+        snapshot_ids.insert(r1_rows.at(shard_id)[3]);
+    }
+    EXPECT_EQ(snapshot_ids.size(), 4u) << "one snapshot must occupy k distinct physical blocks";
+    for (std::int32_t full_id : r1_rows.at("full")) {
+        EXPECT_EQ(snapshot_ids.count(full_id), 0u) << "a shard snapshot must not alias a full-history page";
+    }
+
+    // r2: r1's 8 tokens + 4 fresh. cap = (12-1)/2 = 5: full matches 4 -> bound
+    // 8; every shard resumes off its own slot-3 snapshot (extent 8) -> the
+    // converged boundary = min over all 5 groups on the P grid = 8.
+    token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());
+    const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
+    r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", r2_tokens));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 8);
+    EXPECT_EQ(op->input_lengths.at(0), 4);
+    EXPECT_EQ(op->prefill_lengths.at(0), 12);
+    EXPECT_EQ(op->input_ids, tail);
+    // 4 claimed base slots + ceil(4/2) = 2 fresh pages in the base table.
+    EXPECT_EQ(op->begins.at(0), 0);
+    EXPECT_EQ(op->sizes.at(0), 6);
+
+    ExpectRowPrefixEq(op->flat_block_tables.at("full").at(0), r1_rows.at("full"), "full row");
+    std::set<std::int32_t> claimed_ids;
+    for (const char* shard_id : kShardIds) {
+        const auto& row = op->flat_block_tables.at(shard_id).at(0);
+        ASSERT_EQ(row.size(), 6u) << shard_id;
+        for (std::size_t s = 0; s <= 2; ++s) {
+            EXPECT_EQ(row[s], 0) << shard_id << " pre-snapshot slot " << s << " must stay a hole";
+        }
+        EXPECT_EQ(row[3], r1_rows.at(shard_id)[3]) << shard_id << ": the snapshot claims back at its own page";
+        EXPECT_GT(row[4], 0) << shard_id;
+        EXPECT_GT(row[5], 0) << shard_id;
+        claimed_ids.insert(row[3]);
+    }
+    EXPECT_EQ(claimed_ids.size(), 4u) << "the k shard claims must be k different blocks";
+
+    // Pool: full claims 4 + one snapshot block per shard (4) + 2 fresh pages
+    // x 5 groups (10) = 18 off the free count.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 18);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool back to baseline after r2 finishes";
+}
+
+// Evicting ONE shard's snapshot drops the converged boundary for everybody:
+// state families never serve a partial k-of-4 resume.
+class FlatStateShardEvictionSuite : public FlatStateShardSuite {
+protected:
+    std::int32_t TotalPages() const override { return 63; }  // 62 usable (page 0 is the null block)
+};
+
+TEST_F(FlatStateShardEvictionSuite, PartialShardEvictionFallsBack) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 62);
+
+    // r1 prefill pops 20 never-used blocks (4 pages x 5 groups).
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    ExecutionPlan prefill = PlanOnce();
+    ASSERT_NE(FindFlatOp(prefill), nullptr);
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 42);
+
+    // Finalize (N=8): registers the snapshots, punches 3 hashless pages per
+    // shard (12 back) and pops the 5-block decode reserve.
+    SendForwardDone("r1", {101});
+    PlanOnce();
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 49);
+
+    // The N=9 round punches slot 3 in every shard: all four snapshot@8 blocks
+    // reach the free list HASH-INTACT, in group order, behind the 12 hashless
+    // pages -- while r1 still holds its full-history pages.
+    const auto rows_n9 = AdvanceOneRound("r1", 102);
+    for (const char* shard_id : kShardIds) {
+        EXPECT_EQ(rows_n9.at(shard_id)[3], 0) << shard_id << ": the snapshot block must be punched by N=9";
+    }
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 53);
+
+    // r1's reap pushes its remaining 9 blocks (the hashed full pages included)
+    // BEHIND the four snapshots, so the churn below reaches shard0's snapshot
+    // before any full-history page.
+    SendForwardDone("r1", {103});
+    SendFinish("r1");
+    PlanOnce();  // reap r1
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+
+    // Churn (18 fresh tokens): 45 prefill pops + 5 finalize pops consume the
+    // 37 remaining never-used + all 12 hashless + EXACTLY shard0's snapshot;
+    // shards 1..3 and every full-history page stay cached on the free list.
+    Submit(MakeRequestSpec("churn", /*num_pages=*/9, /*start=*/501));
+    ExecutionPlan churn_prefill = PlanOnce();
+    const FlatForwardOperation* churn_op = FindFlatOp(churn_prefill);
+    ASSERT_NE(churn_op, nullptr);
+    ASSERT_EQ(churn_op->request_ids.size(), 1u);
+    ASSERT_EQ(churn_op->request_ids.at(0), "churn");
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 17);
+    SendForwardDone("churn", {601});
+    PlanOnce();  // finalize: pops the 4 hashless + shard0's snapshot, punches 8 x 4 back
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 44);
+    SendForwardDone("churn", {602});
+    SendFinish("churn");
+    PlanOnce();  // reap the churn
+    ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
+        << "the 3 orphan snapshots sit free-and-cached on the list: nothing leaks";
+
+    // r2 = r1's 8 tokens + 4 fresh. Full still serves 8 and shards 1..3 still
+    // hold their snapshots, but shard0's miss zeroes ITS extent and the
+    // converged boundary = min over ALL groups falls back to 0: a clean full
+    // recompute, never a partial k-of-4 resume.
+    token_vec_t r2_tokens = MakeAlignedTokens(/*num_pages=*/4, PageSize());
+    const token_vec_t tail = MakeTokens(/*count=*/4, /*start=*/901);
+    r2_tokens.insert(r2_tokens.end(), tail.begin(), tail.end());
+    Submit(MakeSpecWithTokens("r2", r2_tokens));
+    ExecutionPlan plan = PlanOnce();
+    const FlatForwardOperation* op = FindFlatOp(plan);
+    ASSERT_NE(op, nullptr);
+    ASSERT_EQ(op->request_ids.size(), 1u);
+    EXPECT_EQ(op->extend_prefix_lens.at(0), 0) << "one missing shard snapshot must drop the whole hit";
+    EXPECT_EQ(op->input_lengths.at(0), 12);
+    EXPECT_EQ(op->input_ids, r2_tokens);
+    // No claims at all: 6 fresh pages x 5 groups off the free count.
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 30);
+
+    SendForwardDone("r2", {199});
+    PlanOnce();
+    SendForwardDone("r2", {200});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start) << "pool balances after the fallback recompute";
+}
+
+TEST_F(FlatStateShardSuite, AbortRestoresBaselineAllShards) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    PlanOnce();  // single-chunk prefill: 4 pages x 5 groups
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 20);
+
+    // Finalize: W=2 punches shard slots 0..2 (12 back) and the decode reserve
+    // takes 1 page per group (5 out): full holds 5, each shard holds 2.
+    SendForwardDone("r1", {42});
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start - 13)
+        << "mid-decode hold must be full 5 + 4 shards x (snapshot + reserve)";
+
+    SendForwardDone("r1", {43});
+    SendAbort(*scheduler_, "r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start)
+        << "abort must roll back all five groups to the pool baseline";
+    EXPECT_EQ(scheduler_->DecodingSize(), 0u);
+}
+
+// Tight pool: the all-or-nothing admission gate charges the (1 full + 4 shard)
+// budget group by group; the pool fits exactly one 8-token request.
+class FlatStateShardTinyPoolSuite : public FlatStateShardSuite {
+protected:
+    // 8 tokens = 4 blocks x 5 groups = 20, + 1 reserve block per group = 25;
+    // 26 physical pages -> 25 usable (page 0 is the null block).
+    std::int32_t TotalPages() const override { return 26; }
+};
+
+TEST_F(FlatStateShardTinyPoolSuite, TinyPoolGatesPerShardBlockMath) {
+    const std::int32_t free_at_start = scheduler_->FlatPoolFreeBlocks();
+    ASSERT_EQ(free_at_start, 25);
+
+    // r1 gate: 20 prefill + 5 reserve = 25 (exact fit); prefill consumes 20.
+    Submit(MakeRequestSpec("r1", /*num_pages=*/4));
+    ExecutionPlan plan1 = PlanOnce();
+    const FlatForwardOperation* op1 = FindFlatOp(plan1);
+    ASSERT_NE(op1, nullptr);
+    ASSERT_EQ(op1->request_ids.size(), 1u);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 5);
+
+    // r2 (8 fresh tokens) charges the same 25 blocks: deferred. r1's finalize
+    // punches 3 hashless pages per shard (12 back) and acquires the 5-block
+    // reserve, leaving 12 free -- still short of 25.
+    Submit(MakeRequestSpec("r2", /*num_pages=*/4, /*start=*/101));
+    SendForwardDone("r1", {99});
+    ExecutionPlan starved = PlanOnce();
+    const FlatForwardOperation* starved_op = FindFlatOp(starved);
+    ASSERT_NE(starved_op, nullptr);
+    ASSERT_EQ(starved_op->request_ids.size(), 1u) << "only r1's reserved decode step fits this round";
+    EXPECT_EQ(starved_op->request_ids.at(0), "r1");
+    EXPECT_EQ(scheduler_->WaitingSize(), 1u) << "deferred r2 stays intact in the waiting set";
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 12);
+
+    SendForwardDone("r1", {100});
+    SendFinish("r1");
+    ExecutionPlan plan2 = PlanOnce();
+    const FlatForwardOperation* op2 = FindFlatOp(plan2);
+    ASSERT_NE(op2, nullptr) << "deferred request must be schedulable after pages free up";
+    ASSERT_EQ(op2->request_ids.size(), 1u);
+    EXPECT_EQ(op2->request_ids.at(0), "r2");
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), 5) << "r2's prefill repeats the exact 20-block bill";
+
+    SendForwardDone("r2", {142});
+    SendFinish("r2");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->FlatPoolFreeBlocks(), free_at_start);
+}
+
+// ---------------------------------------------------------------------------
 // M15 streaming L2 sink: pages registered by a planning round batch into ONE
 // D2H write-back; WriteBackDone commits/aborts the host index and unpins the
 // pinned source blocks. Byte movement itself is Phase D.
