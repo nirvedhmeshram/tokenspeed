@@ -26,8 +26,13 @@ packs every state layer's conv row and ssm head groups into segments of
 the full layers' K/V page rows, and this class reinterprets those byte
 ranges as typed tensors -- the fp32 ssm views live INSIDE the bf16 KV
 slabs (dtype reinterpret, not a cast). Row index == page id over the
-single shared page-id space; row 0 is the null page, never written --
-same convention the slabs had.
+single shared page-id space.
+
+WARNING: row 0 aliases the KV dummy page (page 0), which padded tokens
+DO write (see ``mha.py`` ``_create_buffers``) -- unlike the retired
+standalone ``FlatStateSlabs``, row 0 must NOT be assumed zero. A
+consumer seeding recurrent state from "no history" (``state_in == 0``)
+must zero-fill rather than copy row 0 (handled in the backend, M18c T4).
 
 Flat-GDN gate semantics carry over verbatim from ``FlatStateSlabs``: one
 boolean gates both skipping per-layer KV on state layers and binding the
@@ -43,6 +48,7 @@ from typing import NamedTuple
 import torch
 
 from tokenspeed.runtime.configs import paged_cache_spec
+from tokenspeed.runtime.configs.flat_memory_plan import StateShardBinTable
 from tokenspeed.runtime.configs.paged_cache_spec import STATE_LAYER_TYPES
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -57,7 +63,16 @@ class StateHeadGroup(NamedTuple):
     ``[head_begin, head_begin + num_heads)``. ``shard`` selects which
     ``linear_attention_shard{i}`` block table pages this group's ssm rows,
     ``conv_shard`` which one pages the conv rows (the bin packing may land
-    them on different shards)."""
+    them on different shards).
+
+    Both ``ssm`` and ``conv`` are NON-contiguous strided views: dim 0
+    strides a whole page row (the K/V slab row), not the group's own
+    element count, so a tail group is necessarily discontiguous. Address
+    them only by ``.stride()`` or advanced indexing. Calling
+    ``.contiguous()`` / ``.reshape()`` on them yields a COPY; writing into
+    that copy (e.g. a harvest scatter) silently drops the update. A
+    flashinfer-class kernel must check the layout explicitly before
+    consuming these views."""
 
     conv: torch.Tensor  # (N, *conv_state_shape) view, whole layer
     ssm: torch.Tensor  # (N, num_heads, *state_dims) view, this group
@@ -105,7 +120,7 @@ class StateShardView:
     def __init__(
         self,
         *,
-        bin_table,
+        bin_table: StateShardBinTable | None,
         layer_types: tuple[str, ...],
         conv_state_shape: tuple[int, ...] | None,
         temporal_state_shape: tuple[int, ...] | None,
@@ -206,7 +221,23 @@ class StateShardView:
         """
         if not self._flat_gdn:
             raise ValueError("StateShardView.bind called while inactive")
-        assert self.size % self.page_size == 0, "flat pool size must be whole pages"
+        if self._state_buffers:
+            raise RuntimeError("StateShardView already bound")
+        if len(k_buffers) != len(v_buffers):
+            raise ValueError(
+                f"bind got {len(k_buffers)} K slabs but {len(v_buffers)} V "
+                "slabs; the full layers' slot enumeration must be symmetric"
+            )
+        seen: dict[int, None] = {}
+        for buf in (*k_buffers, *v_buffers):
+            if id(buf) in seen:
+                raise ValueError(
+                    "bind got a duplicate slab tensor across K/V; two slot "
+                    "segments would alias the same storage"
+                )
+            seen[id(buf)] = None
+        if self.size % self.page_size != 0:
+            raise ValueError("flat pool size must be whole pages")
         n = self.size // self.page_size + 1
         self.num_pages_with_null = n
         table = self._bin_table
@@ -253,9 +284,10 @@ class StateShardView:
         # layer's head groups below).
         conv_views: dict[int, tuple[torch.Tensor, int]] = {}
         for entry in table.conv_entries:
-            assert entry.nbytes == (
+            if entry.nbytes != (
                 math.prod(self._conv_state_shape) * self._conv_dtype.itemsize
-            ), "conv bin entry size disagrees with conv_state_shape"
+            ):
+                raise ValueError("conv bin entry size disagrees with conv_state_shape")
             conv_views[entry.state_layer] = (
                 _reinterpret(entry, self._conv_dtype, self._conv_state_shape),
                 entry.shard,
@@ -268,9 +300,12 @@ class StateShardView:
         head_elems = math.prod(state_dims)
         ssm_views: dict[int, list[tuple]] = {}
         for entry in table.ssm_entries:
-            assert entry.nbytes == (
+            if entry.nbytes != (
                 entry.num_heads * head_elems * self._ssm_dtype.itemsize
-            ), "ssm bin entry size disagrees with temporal_state_shape"
+            ):
+                raise ValueError(
+                    "ssm bin entry size disagrees with temporal_state_shape"
+                )
             view = _reinterpret(entry, self._ssm_dtype, (entry.num_heads, *state_dims))
             ssm_views.setdefault(entry.state_layer, []).append((entry, view))
 

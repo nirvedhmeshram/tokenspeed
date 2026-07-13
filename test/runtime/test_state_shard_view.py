@@ -296,6 +296,28 @@ class StateShardViewTest(unittest.TestCase):
         expected = sum(e.nbytes for e in table.ssm_entries + table.conv_entries)
         self.assertEqual(marked, expected)
 
+    # 7. Bind guards ---------------------------------------------------------
+
+    def test_repeated_bind_raises(self):
+        view, k, v = self._bound_view()
+        with self.assertRaisesRegex(RuntimeError, r"already bound"):
+            view.bind(k, v)
+
+    def test_bind_asymmetric_kv_lengths_raises(self):
+        view = self._view()
+        k, v = self._slabs()
+        with self.assertRaisesRegex(ValueError, r"K slabs but"):
+            view.bind(k, v[:-1])
+
+    def test_bind_duplicate_slab_tensor_raises(self):
+        view = self._view()
+        k, v = self._slabs()
+        # Alias a K slab into the V list: two slot segments would share
+        # storage, silently colliding.
+        v[0] = k[0]
+        with self.assertRaisesRegex(ValueError, r"duplicate slab tensor"):
+            view.bind(k, v)
+
 
 if __name__ == "__main__":
     unittest.main()
