@@ -57,6 +57,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_k,
     stride_v,
     stride_b,
+    stride_a,
+    h0_row_stride,
     NP2_T: tl.constexpr,
     B: tl.constexpr,
     H: tl.constexpr,
@@ -103,7 +105,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Gating computation pointers
     p_A_log = A_log + i_hv
-    p_a = a + bos * HV + i_hv
+    p_a = a + bos * stride_a + i_hv
     p_dt_bias = dt_bias + i_hv
 
     mask_k = o_k < K
@@ -114,9 +116,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
+            # h0_source rows may be non-contiguous strided views (flat GDN
+            # state shards over the K/V slabs); rows stay inner-contiguous.
             p_h0 = (
                 h0_source
-                + idx * HV * K * V
+                + idx.to(tl.int64) * h0_row_stride
                 + i_hv * K * V
                 + o_k[:, None] * V
                 + o_v[None, :]
@@ -185,7 +189,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if out_idx >= 0:
                 output_ptr = (
                     h0_source
-                    + out_idx * HV * K * V
+                    + out_idx * h0_row_stride
                     + i_hv * K * V
                     + o_k[:, None] * V
                     + o_v[None, :]
@@ -212,7 +216,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         p_v += stride_v
         p_b += stride_b
         p_o += HV * V
-        p_a += HV
+        p_a += stride_a
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
@@ -221,7 +225,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             if idx >= 0:
                 p_h0 = (
                     h0_source
-                    + idx * HV * K * V
+                    + idx.to(tl.int64) * h0_row_stride
                     + i_hv * K * V
                     + o_k[:, None] * V
                     + o_v[None, :]
@@ -266,7 +270,29 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_k = k.stride()[1]
     stride_v = v.stride()[1]
     stride_b = b.stride()[-2]
+    stride_a = a.stride()[-2]
     HV = v.shape[2]
+    # h0 rows may be non-contiguous strided views (flat GDN state shards
+    # over the K/V slabs): dim 0 strides a whole page row. The kernel
+    # addresses rows by h0_row_stride but keeps the dense in-row layout
+    # (i_hv*K*V + o_k*V + o_v), so each row must stay inner-contiguous.
+    if initial_state_source is not None:
+        src_hv, src_k, src_v = initial_state_source.shape[-3:]
+        if initial_state_source.stride()[-3:] != (src_k * src_v, src_v, 1):
+            raise ValueError(
+                "initial_state_source rows must be contiguous (HV, K, V) "
+                f"blocks; got shape {tuple(initial_state_source.shape)} with "
+                f"strides {tuple(initial_state_source.stride())}"
+            )
+        if (src_hv, src_k, src_v) != (HV, K, V):
+            raise ValueError(
+                "initial_state_source rows must hold exactly this call's "
+                f"(HV={HV}, K={K}, V={V}) heads; got "
+                f"{tuple(initial_state_source.shape[-3:])}"
+            )
+        h0_row_stride = initial_state_source.stride(0)
+    else:
+        h0_row_stride = 0
     N = B if cu_seqlens is None else len(cu_seqlens) - 1
     BK, BV = triton.next_power_of_2(K), min(triton.next_power_of_2(V), 32)
     NK, NV = triton.cdiv(K, BK), triton.cdiv(V, BV)
@@ -319,6 +345,8 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_k=stride_k,
         stride_v=stride_v,
         stride_b=stride_b,
+        stride_a=stride_a,
+        h0_row_stride=h0_row_stride,
         NP2_T=NP2_T,
         B=B,
         H=H,
