@@ -71,6 +71,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
         temporal_state_shape: tuple[int, ...] | None = None,
         conv_dtype: torch.dtype | None = None,
         ssm_dtype: torch.dtype | None = None,
+        num_state_shards: int | None = None,
     ):
         super().__init__(
             size, dtype, device, max_batch_size, max_context_len, page_size, rank
@@ -137,6 +138,7 @@ class MHATokenToKVPool(BaseTokenToKVPool):
             max_scheduled_tokens=max_scheduled_tokens,
             max_total_tokens=size,
             max_context_len=max_context_len,
+            num_state_shards=num_state_shards,
         )
         if published is None:
             self.paged_cache_group_specs = ()

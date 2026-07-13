@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import torch
 
+from tokenspeed.runtime.configs.flat_memory_plan import StateShardBinTable
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.configs.paged_cache_spec import (
     STATE_LAYER_TYPES,
@@ -56,6 +57,10 @@ class MHAConfig(BaseAttnConfig):
     temporal_state_shape: tuple[int, ...] | None = None
     conv_dtype: torch.dtype | None = None
     ssm_dtype: torch.dtype | None = None
+    # State-shard bin table (M18c state binning), the single source of truth
+    # for the fan-out k. Set by the registry's flat-GDN branch; None on every
+    # other path (legacy: state groups keep their bare names).
+    state_bin_table: StateShardBinTable | None = None
 
     @classmethod
     def generate(
@@ -166,4 +171,11 @@ class MHAConfig(BaseAttnConfig):
             temporal_state_shape=self.temporal_state_shape,
             conv_dtype=self.conv_dtype,
             ssm_dtype=self.ssm_dtype,
+            # Fan-out k derived from the state bin table (M18c state binning);
+            # None everywhere the table is absent -> legacy bare-name groups.
+            num_state_shards=(
+                self.state_bin_table.num_shards
+                if self.state_bin_table is not None
+                else None
+            ),
         )

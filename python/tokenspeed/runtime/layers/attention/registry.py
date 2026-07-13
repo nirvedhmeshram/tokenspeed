@@ -21,12 +21,14 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.configs.flat_memory_plan import (
+    STATE_LAYER_TYPES,
     components_from_layers,
-    equalized_block_size,
     plan_component_tensors,
+    shard_bin_table,
     state_const_bytes,
 )
 from tokenspeed.runtime.configs.model_config import AttentionArch, is_deepseek_v4
@@ -424,21 +426,36 @@ def create_attn_components(
         else None
     )
     if is_flat_gdn:
-        equalized_block_size_value = equalized_block_size(
-            layer_types=list(config.layer_types),
-            kv_bytes_per_slot=config.cache_cell_size(),
-            state_const_bytes=gdn_state_bytes,
+        if server_args.block_size % 64 != 0:
+            raise ValueError(
+                "flat GDN requires block_size to be a multiple of 64, got "
+                f"{server_args.block_size}; set server_args.block_size to a "
+                "multiple of 64 (e.g. 128 or 256)"
+            )
+        state_bin_table = shard_bin_table(
+            num_full_layers=sum(
+                1 for t in config.layer_types if t not in STATE_LAYER_TYPES
+            ),
+            num_state_layers=sum(
+                1 for t in config.layer_types if t in STATE_LAYER_TYPES
+            ),
+            ssm_heads_per_layer=config.temporal_state_shape[0],
+            ssm_head_bytes=(
+                config.temporal_state_shape[1]
+                * config.temporal_state_shape[2]
+                * config.ssm_dtype.itemsize
+            ),
+            conv_bytes_per_layer=math.prod(config.conv_state_shape)
+            * config.conv_dtype.itemsize,
+            kv_cell_bytes_per_tok=config.cache_cell_size(),
             block_size=server_args.block_size,
         )
-        if equalized_block_size_value != server_args.block_size:
-            logger.info(
-                "Setting attention block size to %d tokens to cover the GDN "
-                "state row (configured block size %d)",
-                equalized_block_size_value,
-                server_args.block_size,
-            )
-            server_args.block_size = equalized_block_size_value
-            config.page_size = equalized_block_size_value
+        config.state_bin_table = state_bin_table
+        logger.info(
+            "Flat GDN: block_size=%d kept (no equalizer), state shards k=%d",
+            server_args.block_size,
+            state_bin_table.num_shards,
+        )
     draft_attn_config = None
     if draft_model_config:
         draft_attn_config = _create_attn_config(
@@ -585,11 +602,16 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
         flat_plan = plan_component_tensors(
-            components_from_layers(
-                layer_types=list(config.layer_types),
-                kv_bytes_per_slot=config.cache_cell_size(),
-                state_const_bytes=gdn_state_bytes,
-            ),
+            # state is aliased over the full layers' rows (M18c): not charged per block
+            [
+                c
+                for c in components_from_layers(
+                    layer_types=list(config.layer_types),
+                    kv_bytes_per_slot=config.cache_cell_size(),
+                    state_const_bytes=gdn_state_bytes,
+                )
+                if c.group_id not in STATE_LAYER_TYPES
+            ],
             block_size=server_args.block_size,
             budget_bytes=cache_memory,
             reserved_bytes_per_block=draft_row_bytes,
