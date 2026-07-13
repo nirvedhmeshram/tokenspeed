@@ -64,9 +64,7 @@ def triton_gdn_chunk_prefill(
     output_h: bool = False,
     checkpoint_interval: int | None = None,
 ) -> GdnChunkPrefillResult:
-    # checkpoint_interval only parameterizes the FLASHINFER checkpoint grid;
-    # the FLA ``h`` workspace is always on the fixed 64-token chunk grid, so
-    # the caller must index FLA-layout checkpoints by that grid regardless.
+    # FLA ``h`` checkpoints stay on the fixed 64-token grid regardless.
     del checkpoint_interval
     result = chunk_gated_delta_rule(
         q=q,

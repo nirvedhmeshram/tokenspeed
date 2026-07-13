@@ -73,7 +73,11 @@ class FlatHarvestMetadataTest(unittest.TestCase):
         self.MambaAttnBackend = MambaAttnBackend
 
     def _metadata(self, seq_lens, prefix_lens, rows, page_size=None):
+        """``rows`` is the shard0 table, or a dict {group_id: table} for
+        multi-shard batches."""
         torch = self.torch
+        if not isinstance(rows, dict):
+            rows = {"linear_attention_shard0": rows}
         backend = _make_flat_backend(
             torch,
             self.MambaAttnBackend,
@@ -81,6 +85,7 @@ class FlatHarvestMetadataTest(unittest.TestCase):
             H=16,
             D=128,
             P=page_size or self.P,
+            num_shards=len(rows),
         )
         self.assertTrue(backend.flat_state_active)
         bs = len(seq_lens)
@@ -91,7 +96,8 @@ class FlatHarvestMetadataTest(unittest.TestCase):
             forward_mode=self.ForwardMode.EXTEND,
             extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
             flat_block_tables={
-                "linear_attention_shard0": torch.tensor(rows, dtype=torch.int32)
+                gid: torch.tensor(table, dtype=torch.int32)
+                for gid, table in rows.items()
             },
         )
         return backend.forward_metadata
@@ -100,42 +106,44 @@ class FlatHarvestMetadataTest(unittest.TestCase):
         # 100 tokens cross the slot-0 boundary at 64: harvest ckpt 0 into
         # the slot-0 page.
         md = self._metadata([100], [0], [[7, 9]])
-        self.assertEqual(md.flat_track_mask.tolist(), [True])
-        self.assertEqual(md.flat_track_lens.tolist(), [64])
-        self.assertEqual(md.flat_track_ssm_src.tolist(), [0])
-        self.assertEqual(md.flat_track_ssm_src_fla.tolist(), [1])
-        self.assertEqual(md.flat_track_pages[0].tolist(), [7])
-        self.assertEqual(md.flat_track_sel[0].tolist(), [0])
+        ft = md.flat_track
+        self.assertEqual(ft.mask.tolist(), [True])
+        self.assertEqual(ft.track_lens.tolist(), [64])
+        self.assertEqual(ft.src_fi.tolist(), [0])
+        self.assertEqual(ft.src_fla.tolist(), [1])
+        self.assertEqual(ft.pages[0].tolist(), [7])
+        self.assertEqual(ft.sel[0].tolist(), [0])
 
     def test_chunk_ending_on_boundary_skips(self):
         # Boundary == chunk end: the kernel's final-state write to state_out
         # already lands the boundary state on that page.
         md = self._metadata([128], [0], [[7, 9]])
-        self.assertIsNone(md.flat_track_ssm_src)
+        self.assertIsNone(md.flat_track)
 
     def test_short_prompt_skips(self):
         md = self._metadata([63], [0], [[7]])
-        self.assertIsNone(md.flat_track_ssm_src)
+        self.assertIsNone(md.flat_track)
 
     def test_prefix_chunk_tracks_on_page_grid(self):
         # Chunk [64, 228): last boundary 192 -> slot 2, chunk-relative len
         # 128 -> flashinfer ckpt 1 (interval = P), FLA h[2].
         md = self._metadata([228], [64], [[3, 5, 8, 9]])
-        self.assertEqual(md.flat_track_mask.tolist(), [True])
-        self.assertEqual(md.flat_track_lens.tolist(), [128])
-        self.assertEqual(md.flat_track_ssm_src.tolist(), [1])
-        self.assertEqual(md.flat_track_ssm_src_fla.tolist(), [2])
-        self.assertEqual(md.flat_track_pages[0].tolist(), [8])
+        ft = md.flat_track
+        self.assertEqual(ft.mask.tolist(), [True])
+        self.assertEqual(ft.track_lens.tolist(), [128])
+        self.assertEqual(ft.src_fi.tolist(), [1])
+        self.assertEqual(ft.src_fla.tolist(), [2])
+        self.assertEqual(ft.pages[0].tolist(), [8])
 
     def test_unaligned_prefix_skips(self):
         # prefix 32: the boundary is off the kernel checkpoint grid.
         md = self._metadata([161], [32], [[3, 5, 8]])
-        self.assertIsNone(md.flat_track_ssm_src)
+        self.assertIsNone(md.flat_track)
 
     def test_hole_boundary_page_skips(self):
         # Boundary page is a hole (0 = the aliased null row, never written).
         md = self._metadata([100], [0], [[0, 9]])
-        self.assertIsNone(md.flat_track_ssm_src)
+        self.assertIsNone(md.flat_track)
 
     def test_mixed_batch_masks_per_request(self):
         md = self._metadata(
@@ -143,18 +151,38 @@ class FlatHarvestMetadataTest(unittest.TestCase):
             [0, 0, 0],
             [[7, 9, -1, -1], [21, -1, -1, -1], [31, 33, 35, 36]],
         )
-        self.assertEqual(md.flat_track_mask.tolist(), [True, False, True])
+        ft = md.flat_track
+        self.assertEqual(ft.mask.tolist(), [True, False, True])
         # Checkpoint offsets accumulate per request (L // P = [1, 1, 3]):
         # req0 harvests its ckpt 0; req2 its ckpt 2 (boundary 192, slot 2).
-        self.assertEqual(md.flat_track_ssm_src.tolist(), [0, 4])
-        self.assertEqual(md.flat_track_pages[0].tolist(), [7, 35])
-        self.assertEqual(md.flat_track_sel[0].tolist(), [0, 1])
+        self.assertEqual(ft.src_fi.tolist(), [0, 4])
+        self.assertEqual(ft.pages[0].tolist(), [7, 35])
+        self.assertEqual(ft.sel[0].tolist(), [0, 1])
+
+    def test_multi_shard_hole_filters_only_that_shard(self):
+        # k=2 divergence: shard0's boundary page is valid while shard1's is
+        # a hole. The harvest must still fire for shard0 and only filter
+        # shard1's row -- not drop the whole request.
+        md = self._metadata(
+            [100],
+            [0],
+            {
+                "linear_attention_shard0": [[7, 9]],
+                "linear_attention_shard1": [[0, 11]],
+            },
+        )
+        ft = md.flat_track
+        self.assertIsNotNone(ft)
+        self.assertEqual(ft.mask.tolist(), [True])
+        self.assertEqual(ft.pages[0].tolist(), [7])
+        self.assertEqual(ft.sel[0].tolist(), [0])
+        self.assertEqual(ft.pages[1].tolist(), [])
+        self.assertEqual(ft.sel[1].tolist(), [])
 
     def test_non_multiple_page_size_disables_harvest(self):
         # P off the 64-token kernel grid (stub/test pools only): no harvest.
         md = self._metadata([10], [0], [[7, 9, 12]], page_size=4)
-        self.assertIsNone(md.flat_track_ssm_src)
-        self.assertIsNone(md.flat_track_mask)
+        self.assertIsNone(md.flat_track)
 
 
 class GDNFlatHarvestGPUTest(unittest.TestCase):
@@ -335,7 +363,7 @@ class GDNFlatHarvestGPUTest(unittest.TestCase):
         )
         rows = list(range(1, boundary // self.P + 1))
         self._prefill_chunks(backend, inp, [(0, boundary)], [rows])
-        self.assertIsNone(backend.forward_metadata.flat_track_ssm_src)
+        self.assertIsNone(backend.forward_metadata.flat_track)
         out_page = rows[-1]
         return conv_slab[out_page].clone(), ssm_slab[out_page].clone()
 
@@ -369,11 +397,11 @@ class GDNFlatHarvestGPUTest(unittest.TestCase):
         rows = list(range(1, num_slots + 1))
         self._prefill_chunks(backend, inp, chunks, [rows] * num_shards)
 
-        md = backend.forward_metadata
-        self.assertIsNotNone(md.flat_track_ssm_src)
+        ft = backend.forward_metadata.flat_track
+        self.assertIsNotNone(ft)
         boundary_page = rows[boundary // self.P - 1]  # 14
         for s in range(num_shards):
-            self.assertEqual(md.flat_track_pages[s].tolist(), [boundary_page])
+            self.assertEqual(ft.pages[s].tolist(), [boundary_page])
 
         # The boundary state is a snapshot of the exact same chunk-sequential
         # scan the truncated rerun performs (identical bf16 inputs, fp32
@@ -447,7 +475,7 @@ class GDNFlatHarvestGPUTest(unittest.TestCase):
         rows = list(range(1, num_slots + 1))
         rows[self.PROMPT // self.P - 1] = 0  # boundary slot is a hole
         self._prefill_chunks(backend, inp, [(0, self.PROMPT)], [rows])
-        self.assertIsNone(backend.forward_metadata.flat_track_ssm_src)
+        self.assertIsNone(backend.forward_metadata.flat_track)
         self.assertEqual(ssm_slab[0].abs().max().item(), 0.0)
         self.assertEqual(conv_slab[0].abs().max().item(), 0.0)
 
@@ -480,9 +508,9 @@ class GDNFlatHarvestGPUTest(unittest.TestCase):
             extend_prefix_lens=torch.zeros(2, dtype=torch.int32, device="cuda"),
             flat_block_tables=tables,
         )
-        md = backend.forward_metadata
-        self.assertEqual(md.flat_track_mask.tolist(), [True, False])
-        self.assertEqual(md.flat_track_pages[0].tolist(), [1])
+        ft = backend.forward_metadata.flat_track
+        self.assertEqual(ft.mask.tolist(), [True, False])
+        self.assertEqual(ft.pages[0].tolist(), [1])
         backend.forward_extend(
             None,
             None,

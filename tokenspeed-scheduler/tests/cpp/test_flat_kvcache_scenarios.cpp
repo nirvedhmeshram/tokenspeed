@@ -26,6 +26,7 @@
 #if TOKENSPEED_FLAT_KVCACHE
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -3098,8 +3099,17 @@ TEST_F(FlatStateShardEvictionSuite, PartialShardEvictionFallsBack) {
     // r1 prefill pops 20 never-used blocks (4 pages x 5 groups).
     Submit(MakeRequestSpec("r1", /*num_pages=*/4));
     ExecutionPlan prefill = PlanOnce();
-    ASSERT_NE(FindFlatOp(prefill), nullptr);
+    const FlatForwardOperation* r1_op = FindFlatOp(prefill);
+    ASSERT_NE(r1_op, nullptr);
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 42);
+
+    // Each shard row's slot-3 block becomes that shard's snapshot@8 on
+    // finalize; captured now to pin WHICH snapshot the churn consumes below.
+    std::map<std::string, std::int32_t> snapshot_of;
+    for (const char* shard_id : kShardIds) {
+        snapshot_of[shard_id] = r1_op->flat_block_tables.at(shard_id).at(0).at(3);
+        ASSERT_GT(snapshot_of[shard_id], 0) << shard_id;
+    }
 
     // Finalize (N=8): registers the snapshots, punches 3 hashless pages per
     // shard (12 back) and pops the 5-block decode reserve.
@@ -3134,9 +3144,31 @@ TEST_F(FlatStateShardEvictionSuite, PartialShardEvictionFallsBack) {
     ASSERT_EQ(churn_op->request_ids.size(), 1u);
     ASSERT_EQ(churn_op->request_ids.at(0), "churn");
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 17);
-    SendForwardDone("churn", {601});
-    PlanOnce();  // finalize: pops the 4 hashless + shard0's snapshot, punches 8 x 4 back
+    // Finalize: pops the 4 hashless + shard0's snapshot, punches 8 x 4 back.
+    // The round's rows carry the reserve pages the finalize just popped.
+    const auto churn_rows = AdvanceOneRound("churn", 601);
     ASSERT_EQ(scheduler_->FlatPoolFreeBlocks(), 44);
+
+    // "EXACTLY shard0's snapshot" as an assertion, not a comment: union every
+    // block id the churn holds (prefill claims + post-finalize rows) and check
+    // the four snapshots' membership against it.
+    std::set<std::int32_t> churn_ids;
+    for (const auto& [gid, table] : churn_op->flat_block_tables) {
+        for (std::int32_t id : table.at(0)) {
+            if (id > 0) churn_ids.insert(id);
+        }
+    }
+    for (const auto& [gid, row] : churn_rows) {
+        for (std::int32_t id : row) {
+            if (id > 0) churn_ids.insert(id);
+        }
+    }
+    EXPECT_EQ(churn_ids.count(snapshot_of[kShardIds[0]]), 1u)
+        << "the churn must consume shard0's snapshot block";
+    for (std::size_t s = 1; s < 4; ++s) {
+        EXPECT_EQ(churn_ids.count(snapshot_of[kShardIds[s]]), 0u)
+            << kShardIds[s] << ": the snapshot block must survive the churn untouched";
+    }
     SendForwardDone("churn", {602});
     SendFinish("churn");
     PlanOnce();  // reap the churn
