@@ -138,6 +138,7 @@ if is_available():
         qk_l2norm: bool = False,
         output_final_state: bool = True,
         output_h: bool = False,
+        checkpoint_interval: int | None = None,
     ):
         """Run one chunked GDN prefill on the sm100 kernel.
 
@@ -148,12 +149,18 @@ if is_available():
         Default returns ``(out, final_state)`` matching the FLA layout:
         out [B, T, Hv, D] in q.dtype, final_state [N, H, K, V].
 
+        ``checkpoint_interval`` sets the token stride between checkpoints when
+        ``output_h=True`` (``None`` -> ``CHUNK_SIZE``, the historical default);
+        it must be a positive multiple of ``CHUNK_SIZE`` (the sm100 kernel's
+        native chunk grid, validated on the flashinfer side too).
+
         When ``output_h=True`` returns
         ``(out, final_state, fi_checkpoints, checkpoint_cu_starts)`` where:
         - ``fi_checkpoints``: raw flashinfer checkpoint buffer in FLA state layout
           ``[total_fi_ckpts, H, K, V]`` (float32). Checkpoint ``k`` within a
-          sequence is the state *after* processing chunk ``k`` (= FLA ``h[k+1]``).
-          Per-sequence count is ``L_i // CHUNK_SIZE``.
+          sequence is the state *after* processing the sequence's interval ``k``,
+          i.e. its first ``(k + 1) * checkpoint_interval`` tokens. Per-sequence
+          count is ``L_i // checkpoint_interval``.
         - ``checkpoint_cu_starts``: int64 tensor of length ``N+1`` giving the
           cumulative start offset of each sequence's checkpoints in
           ``fi_checkpoints``.
@@ -161,6 +168,13 @@ if is_available():
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
         """
+        if checkpoint_interval is None:
+            checkpoint_interval = CHUNK_SIZE
+        if checkpoint_interval <= 0 or checkpoint_interval % CHUNK_SIZE != 0:
+            raise ValueError(
+                f"checkpoint_interval must be a positive multiple of "
+                f"{CHUNK_SIZE}, got {checkpoint_interval}"
+            )
         batched = q.dim() == 4
         q3 = q.squeeze(0) if batched else q
         k3 = k.squeeze(0) if batched else k
@@ -183,8 +197,8 @@ if is_available():
         checkpoint_cu_starts = None
         if output_h:
             per_seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
-            # flashinfer-native checkpoint count: only full chunks emit a checkpoint.
-            per_seq_h_ckpts = per_seq_lens // CHUNK_SIZE
+            # flashinfer-native count: only full intervals emit a checkpoint.
+            per_seq_h_ckpts = per_seq_lens // checkpoint_interval
             total_h_ckpts = int(per_seq_h_ckpts.sum().item())
             H_state = fi_initial_state.shape[1]
             D_state = fi_initial_state.shape[-1]
@@ -215,7 +229,7 @@ if is_available():
             cu_seqlens=cu_seqlens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            checkpoint_every_n_tokens=checkpoint_interval if output_h else 0,
         )
 
         out = out.to(q.dtype)
