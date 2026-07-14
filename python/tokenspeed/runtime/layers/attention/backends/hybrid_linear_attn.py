@@ -611,10 +611,12 @@ class MambaAttnBackend(AttentionBackend):
         self._flat_state_page_size = 1
         self.flat_state_in_list: list[torch.Tensor] = []
         self.flat_state_out_list: list[torch.Tensor] = []
-        # Layers whose head groups already passed the one-time GQA ratio
-        # alignment check (lazy: the q/v head counts only arrive with the
-        # first forward's kwargs).
-        self._gqa_checked_layers: set[int] = set()
+        # layer_id -> (head_base int64[HV], head_shard int32[HV],
+        # page_row_stride) for the flat decode single launch. Built (and the
+        # GQA ratio validated) once on the first forward per layer -- the q/v
+        # head counts and bound ssm views only exist by then; the resulting
+        # constant device tensors keep stable addresses (CUDA-graph safe).
+        self._per_head_maps: dict[int, tuple] = {}
 
     def set_pool(self, pool: SimpleMambaPool):
         self.pool = pool
@@ -1348,6 +1350,50 @@ class MambaAttnBackend(AttentionBackend):
 
     # ---- Forward ----
 
+    def _flat_head_addressing(self, layer_id, head_groups, num_v_heads, num_heads):
+        """Per-head absolute-addressing maps for the flat decode single
+        launch, cached per layer. head_base[h] is head h's ssm-view page-0
+        byte address (each head lives in its own K/V slab); head_shard[h] the
+        page-table row that pages it (T1's head_shard); page_row_stride the
+        elements in one full page row (shared by all slabs). Built once on an
+        eager forward -- the torch.tensor host->device copies must not run
+        under graph capture -- so the maps are constant tensors by replay."""
+        maps = self._per_head_maps.get(layer_id)
+        if maps is not None:
+            return maps
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "flat GDN per-head maps must be built on a warmup forward "
+                f"before CUDA graph capture (layer {layer_id} unseen)"
+            )
+        ratio = num_v_heads // num_heads
+        base_addrs: list[int] = []
+        shard_ids: list[int] = []
+        # head_groups tile [0, HV) in ascending head_begin (asserted in
+        # StateShardView.bind), so appending each group's heads in order lands
+        # head h at index h -- aligned with head_shard and head_base.
+        for g in head_groups:
+            hb, he = g.head_begin, g.head_begin + g.num_heads
+            if hb % ratio or g.num_heads % ratio:
+                raise RuntimeError(
+                    "flat GDN state paging: ssm head group "
+                    f"[{hb}, {he}) is not aligned to the GQA ratio {ratio} "
+                    f"(HV={num_v_heads}, H={num_heads})"
+                )
+            for local in range(g.num_heads):
+                # g.ssm is (N, num_heads, *state_dims); head `local`'s page-0
+                # cell start is its byte address (dim 0 strides a page row).
+                base_addrs.append(g.ssm[:, local].data_ptr())
+                shard_ids.append(g.shard)
+        device = head_groups[0].ssm.device
+        maps = (
+            torch.tensor(base_addrs, dtype=torch.int64, device=device),
+            torch.tensor(shard_ids, dtype=torch.int32, device=device),
+            head_groups[0].ssm.stride(0),
+        )
+        self._per_head_maps[layer_id] = maps
+        return maps
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1453,55 +1499,39 @@ class MambaAttnBackend(AttentionBackend):
         value = value.view(1, seq_len, value.shape[1] // head_v_dim, head_v_dim)
 
         if use_flat:
-            # One kernel launch per ssm head group: q/k/v/a/b are sliced to
-            # the group's value heads (q/k by the GQA ratio), the group's
-            # strided ssm view is the h0 source (row addressing is
-            # h0_row_stride-parameterized in the kernel), and pages come from
-            # the group's own shard table.
+            # One kernel launch for the whole layer: each ssm head is
+            # addressed by its own slab byte base (head_base) plus its page
+            # (head_shard picks the page-table row), so q/k/v/a/b stay
+            # un-sliced and the k shard outputs never need a torch.cat. The
+            # maps (and the one-time GQA ratio check) are built lazily per
+            # layer; initial_state_source is only the state-dtype carrier.
             num_v_heads = value.shape[2]
-            ratio = num_v_heads // num_heads
-            if layer_id not in self._gqa_checked_layers:
-                # One-time lazy gate per layer: the q/v head counts only
-                # arrive with the first forward's kwargs (set_kv_pool sees
-                # neither the per-layer head dims nor the bound head
-                # groups), so the ratio alignment can't be hoisted there.
-                # The head-group layout itself (ascending, contiguous,
-                # head_begin 0 first) is asserted once in
-                # StateShardView.bind.
-                for g in head_groups:
-                    hb, he = g.head_begin, g.head_begin + g.num_heads
-                    if hb % ratio or g.num_heads % ratio:
-                        raise RuntimeError(
-                            "flat GDN state paging: ssm head group "
-                            f"[{hb}, {he}) is not aligned to the GQA ratio "
-                            f"{ratio} (HV={num_v_heads}, H={num_heads})"
-                        )
-                self._gqa_checked_layers.add(layer_id)
-            outs = []
-            for g in head_groups:
-                hb, he = g.head_begin, g.head_begin + g.num_heads
-                outs.append(
-                    fused_sigmoid_gating_delta_rule_update(
-                        A_log=A_log[hb:he],
-                        dt_bias=dt_bias[hb:he],
-                        q=query[:, :, hb // ratio : he // ratio],
-                        k=key[:, :, hb // ratio : he // ratio],
-                        v=value[:, :, hb:he],
-                        a=a[..., hb:he],
-                        b=b[..., hb:he],
-                        initial_state_source=g.ssm,
-                        initial_state_indices=state_in_pages[g.shard],
-                        cu_seqlens=query_start_loc,
-                        use_qk_l2norm_in_kernel=True,
-                        softplus_beta=1.0,
-                        softplus_threshold=20.0,
-                        # Flat: don't write back to the (possibly shared) in
-                        # page; the post-step state lands on the out page.
-                        disable_state_update=True,
-                        output_state_indices=state_out_pages[g.shard],
-                    )
-                )
-            core_attn_out = outs[0] if len(outs) == 1 else torch.cat(outs, dim=2)
+            head_base, head_shard, page_row_stride = self._flat_head_addressing(
+                layer_id, head_groups, num_v_heads, num_heads
+            )
+            core_attn_out = fused_sigmoid_gating_delta_rule_update(
+                A_log=A_log,
+                dt_bias=dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                initial_state_source=head_groups[0].ssm,
+                initial_state_indices=None,
+                cu_seqlens=query_start_loc,
+                use_qk_l2norm_in_kernel=True,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                # Flat: post-step state lands on the out page; no in-place
+                # write-back to the (possibly shared) in page.
+                disable_state_update=True,
+                head_base=head_base,
+                head_shard=head_shard,
+                page_row_stride=page_row_stride,
+                state_in_pages=state_in_pages,
+                state_out_pages=state_out_pages,
+            )
         else:
             core_attn_out = fused_sigmoid_gating_delta_rule_update(
                 A_log=A_log,

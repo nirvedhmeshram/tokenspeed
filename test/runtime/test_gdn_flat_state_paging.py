@@ -685,8 +685,8 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
     def test_two_head_group_shards_match_fla_oracle(self):
         """k = 2: the layer's ssm heads split across two shard groups whose
         views are NON-contiguous head slices of the slab (row stride = the
-        whole slab row) — exercising the per-group decode loop, the
-        h0_row_stride kernel addressing, and the extend gather/scatter."""
+        whole slab row) — exercising the decode single launch's per-head
+        absolute addressing across two shards and the extend gather/scatter."""
         torch = self.torch
         inp = self._make_inputs()
         o_ref, st_ref = self._oracle(inp)
@@ -719,6 +719,55 @@ class GDNFlatStatePagingGPUTest(unittest.TestCase):
         self._check_oracle_match(o_flat, o_ref, ssm_slab, st_ref)
         self.assertEqual(conv_slab[0].abs().max().item(), 0.0)
         self.assertEqual(ssm_slab[0].abs().max().item(), 0.0)
+
+    def test_decode_single_issue_per_head_maps(self):
+        """The flat decode collapses the k head groups into ONE kernel launch
+        driven by per-head absolute-addressing maps: one map per layer, HV
+        entries, head h's byte base == its ssm view's page-0 address, head h's
+        shard == the group that owns it. The maps are constant tensors reused
+        across steps (same object) -- the CUDA-graph capture prerequisite."""
+        torch = self.torch
+        inp = self._make_inputs()
+
+        conv_slab, ssm_slab = self._slabs()
+        half = self.H // 2
+        groups = [
+            self.StateHeadGroup(
+                conv=conv_slab,
+                ssm=ssm_slab[:, :half],
+                shard=0,
+                conv_shard=0,
+                head_begin=0,
+                num_heads=half,
+            ),
+            self.StateHeadGroup(
+                conv=conv_slab,
+                ssm=ssm_slab[:, half:],
+                shard=1,
+                conv_shard=0,
+                head_begin=half,
+                num_heads=half,
+            ),
+        ]
+        backend = self._make_backend(groups, num_shards=2)
+        self._drive_flat(backend, inp, num_shards=2, snapshot=lambda: None)
+
+        self.assertEqual(list(backend._per_head_maps), [0])
+        head_base, head_shard, page_row_stride = backend._per_head_maps[0]
+        self.assertEqual(tuple(head_base.shape), (self.H,))
+        self.assertEqual(tuple(head_shard.shape), (self.H,))
+        self.assertEqual(head_base.dtype, torch.int64)
+        self.assertEqual(head_shard.dtype, torch.int32)
+        self.assertEqual(page_row_stride, ssm_slab[:, :half].stride(0))
+        # Head h's base is its own ssm view's page-0 byte address, shard the
+        # group that owns it (heads [0, half) -> shard 0, [half, H) -> 1).
+        expected_base = [ssm_slab[:, h].data_ptr() for h in range(self.H)]
+        self.assertEqual(head_base.tolist(), expected_base)
+        self.assertEqual(head_shard.tolist(), [0] * half + [1] * (self.H - half))
+        # A second decode reuses the SAME tensor objects (stable addresses).
+        again = backend._flat_head_addressing(0, groups, self.H, self.H)
+        self.assertIs(again[0], head_base)
+        self.assertIs(again[1], head_shard)
 
 
 if __name__ == "__main__":
