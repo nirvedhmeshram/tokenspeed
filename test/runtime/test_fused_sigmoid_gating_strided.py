@@ -432,10 +432,11 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
             self.assertTrue(torch.equal(b, s))
 
     def test_missing_head_base_maps_raise(self):
+        torch = self.torch
         inp = self._inputs()
         slabs, _ = self._make_shards(inp.h0)
         base, shard, prs = self._head_maps(slabs)
-        in_pages = torch.zeros(2, self.B, dtype=self.torch.int32, device="cuda")
+        in_pages = torch.zeros(2, self.B, dtype=torch.int32, device="cuda")
         with self.assertRaisesRegex(ValueError, "head_shard"):
             self._per_head(inp, slabs[0], base, None, prs, state_in_pages=in_pages)
         with self.assertRaisesRegex(ValueError, "length HV"):
