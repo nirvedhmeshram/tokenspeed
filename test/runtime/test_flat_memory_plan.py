@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import os
 import pathlib
@@ -42,6 +43,8 @@ components_from_layers = _fmp.components_from_layers
 shard_bin_table = _fmp.shard_bin_table
 ShardBinEntry = _fmp.ShardBinEntry
 StateShardBinTable = _fmp.StateShardBinTable
+head_addressing_maps = _fmp.head_addressing_maps
+StateLayerHeadMap = _fmp.StateLayerHeadMap
 
 
 class EqualizerTest(unittest.TestCase):
@@ -471,6 +474,93 @@ class ShardBinTableTest(unittest.TestCase):
     def test_bin_table_rejects_odd_kv_cell(self):
         with self.assertRaisesRegex(ValueError, "even"):
             shard_bin_table(**{**TP8_KW, "kv_cell_bytes_per_tok": 1023})
+
+
+SSM_HEAD_ELEMS = 128 * 128  # temporal_state_shape[1:] = (128, 128); fp32 -> itemsize 4
+
+
+class HeadAddressingTest(unittest.TestCase):
+    def test_tp8_per_head_maps_match_ssm_entries(self):
+        bt = shard_bin_table(**TP8_KW)
+        maps = head_addressing_maps(bt, ssm_head_elems=SSM_HEAD_ELEMS)
+        # 30 state layers -> 30 maps, each covering heads_per_layer == 4 heads.
+        self.assertEqual(len(maps), 30)
+        self.assertEqual(len(maps[0].head_shard), 4)
+        self.assertEqual(len(maps[0].head_elem_offset), 4)
+        # Hand calc from the real bin table (printed ssm_entries[:2] of layer 0):
+        #   entry0: head_begin=0 num_heads=2 shard=0 nbytes=131072 byte_offset=0
+        #   entry1: head_begin=2 num_heads=2 shard=0 nbytes=131072 byte_offset=0
+        # itemsize = (131072//2)//16384 = 65536//16384 = 4 bytes (fp32).
+        # entry0 elem_base = 0//4 = 0 -> heads 0,1 at 0, 0+16384.
+        # entry1 elem_base = 0//4 = 0 -> heads 2,3 at 0, 0+16384.
+        # Both groups sit at byte_offset 0 of their (distinct kv_side) segments,
+        # so heads 0 and 2 both land at element 0 within their shard's ssm view.
+        self.assertEqual(maps[0].head_shard, (0, 0, 0, 0))
+        self.assertEqual(maps[0].head_elem_offset, (0, 16384, 0, 16384))
+        # Two heads within one group differ by exactly one ssm head cell.
+        self.assertEqual(
+            maps[0].head_elem_offset[1] - maps[0].head_elem_offset[0], SSM_HEAD_ELEMS
+        )
+        self.assertEqual(
+            maps[0].head_elem_offset[3] - maps[0].head_elem_offset[2], SSM_HEAD_ELEMS
+        )
+
+    def test_tp1_32_heads_span_multiple_shards(self):
+        # tp1: 32 ssm heads/layer, H_g=4 -> 8 head groups per state layer.
+        # num_full_layers=1 gives segs_per_shard=2*1=2, so consecutive groups
+        # spread across shards fastest; the layer's 8 groups cover 4 distinct
+        # shards (the K and V side of each shard-slab pair share a shard, so 8
+        # groups can never reach 8 distinct shards here).
+        kw = dict(
+            num_full_layers=1,
+            num_state_layers=30,
+            ssm_heads_per_layer=32,
+            ssm_head_bytes=65536,
+            conv_bytes_per_layer=49152,
+            kv_cell_bytes_per_tok=2048,
+            block_size=256,
+        )
+        bt = shard_bin_table(**kw)
+        self.assertEqual(bt.heads_per_group, 4)
+        maps = head_addressing_maps(bt, ssm_head_elems=SSM_HEAD_ELEMS)
+        self.assertEqual(len(maps[0].head_shard), 32)
+        self.assertEqual(sorted(set(maps[0].head_shard)), [0, 1, 2, 3])
+        # Within each 4-head group the offsets tile one cell apart from base 0.
+        for begin in range(0, 32, 4):
+            grp = maps[0].head_elem_offset[begin : begin + 4]
+            self.assertEqual(grp, tuple(h * SSM_HEAD_ELEMS for h in range(4)))
+
+    def test_non_contiguous_head_groups_raise(self):
+        bt = shard_bin_table(**TP8_KW)
+        # Drop layer 0's first ssm group (head_begin=0) so the surviving group
+        # starts at head_begin=2 -> head order no longer tiles from 0.
+        pruned = tuple(
+            e for e in bt.ssm_entries if not (e.state_layer == 0 and e.head_begin == 0)
+        )
+        holed = dataclasses.replace(bt, ssm_entries=pruned)
+        with self.assertRaisesRegex(ValueError, "contiguously"):
+            head_addressing_maps(holed, ssm_head_elems=SSM_HEAD_ELEMS)
+
+    def test_single_shard_degenerate_flat_offsets(self):
+        # k=1: one segment holds all heads of a layer (heads_per_group >= heads),
+        # so every head maps to shard 0 with a plain per-cell stride.
+        kw = dict(
+            num_full_layers=16,
+            num_state_layers=30,
+            ssm_heads_per_layer=4,
+            ssm_head_bytes=65536,
+            conv_bytes_per_layer=6144,
+            kv_cell_bytes_per_tok=4096,
+            block_size=256,
+        )
+        bt = shard_bin_table(**kw)
+        self.assertEqual(bt.num_shards, 1)
+        maps = head_addressing_maps(bt, ssm_head_elems=SSM_HEAD_ELEMS)
+        self.assertEqual(maps[0].head_shard, (0, 0, 0, 0))
+        self.assertEqual(
+            maps[0].head_elem_offset,
+            tuple(h * SSM_HEAD_ELEMS for h in range(4)),
+        )
 
 
 if __name__ == "__main__":

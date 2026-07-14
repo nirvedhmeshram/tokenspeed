@@ -334,3 +334,74 @@ def shard_bin_table(
         ssm_entries=tuple(ssm),
         conv_entries=tuple(conv),
     )
+
+
+@dataclass(frozen=True)
+class StateLayerHeadMap:
+    # Each field's length == that state layer's ssm head count (heads_per_layer).
+    head_shard: tuple[
+        int, ...
+    ]  # head h's page row = this row of state_pages (= entry.shard)
+    head_elem_offset: tuple[
+        int, ...
+    ]  # head h's element offset inside its shard's ssm view
+    #                                    (ssm dtype units, not bytes)
+
+
+def head_addressing_maps(bin_table, *, ssm_head_elems):
+    """Per-state-layer per-head (shard, in-view element offset), expanded from
+    the bin table's ssm entries. Each ssm entry covers a head group; head h in
+    a group at byte_offset b (ssm dtype itemsize s) sits at element offset
+    (b // s) + (h - head_begin) * ssm_head_elems within that shard's slab row.
+    Returns list indexed by state-layer occurrence order (len = num_state_layers).
+
+    Args:
+        bin_table: StateShardBinTable.
+        ssm_head_elems: elements per ssm head cell (= prod(temporal_state_shape[1:]),
+            e.g. 128*128 = 16384). Element unit, matching the kernel's per-head
+            addressing (dtype-agnostic; itemsize handled by caller's byte_offset).
+    Returns:
+        list[StateLayerHeadMap]
+    """
+    by_layer: dict[int, list] = {}
+    order: list[int] = []
+    for e in bin_table.ssm_entries:
+        if e.state_layer not in by_layer:
+            by_layer[e.state_layer] = []
+            order.append(e.state_layer)
+        by_layer[e.state_layer].append(e)
+
+    maps: list[StateLayerHeadMap] = []
+    for layer in order:
+        head_shard: list[int] = []
+        head_elem_offset: list[int] = []
+        next_head = 0
+        for e in sorted(by_layer[layer], key=lambda e: e.head_begin):
+            if e.head_begin != next_head:
+                raise ValueError(
+                    f"state layer {layer}: ssm head groups do not tile [0, N) "
+                    f"contiguously; expected head_begin {next_head}, got "
+                    f"{e.head_begin}"
+                )
+            # byte_offset is bytes; recover ssm dtype itemsize from this entry so
+            # the pure function need not know the dtype: one head is nbytes//num_heads
+            # bytes = itemsize * ssm_head_elems elements.
+            head_bytes = e.nbytes // e.num_heads
+            itemsize = head_bytes // ssm_head_elems
+            if itemsize < 1 or itemsize * ssm_head_elems != head_bytes:
+                raise ValueError(
+                    f"state layer {layer}: head bytes {head_bytes} is not a whole "
+                    f"multiple of ssm_head_elems {ssm_head_elems}"
+                )
+            elem_base = e.byte_offset // itemsize
+            for h in range(e.num_heads):
+                head_shard.append(e.shard)
+                head_elem_offset.append(elem_base + h * ssm_head_elems)
+            next_head += e.num_heads
+        maps.append(
+            StateLayerHeadMap(
+                head_shard=tuple(head_shard),
+                head_elem_offset=tuple(head_elem_offset),
+            )
+        )
+    return maps
