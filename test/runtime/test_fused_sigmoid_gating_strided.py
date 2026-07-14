@@ -221,7 +221,11 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
         torch.manual_seed(0)
 
     def _inputs(self):
+        # Re-seed so every call returns identical tensors: the fold tests
+        # draw inputs and both slab arms from separate _inputs() calls that
+        # must agree bit-for-bit.
         torch = self.torch
+        torch.manual_seed(0)
         B, H, HV, K, V = self.B, self.H, self.HV, self.K, self.V
         return SimpleNamespace(
             q=torch.randn(1, B, H, K, device="cuda", dtype=torch.bfloat16),
@@ -284,7 +288,8 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
         torch = self.torch
         half = self.HV // self.KSHARDS
         ratio = self.HV // self.H
-        base_all, shard_all, prs = self._head_maps(slabs)
+        base_all, _, prs = self._head_maps(slabs)
+        out_pages = overrides.pop("state_out_pages", None)
         outs = []
         for s in range(self.KSHARDS):
             lo, hi = s * half, (s + 1) * half
@@ -308,9 +313,7 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
                     page_row_stride=prs,
                     state_in_pages=in_pages[s : s + 1],
                     state_out_pages=(
-                        overrides.pop("state_out_pages")[s : s + 1]
-                        if "state_out_pages" in overrides
-                        else None
+                        None if out_pages is None else out_pages[s : s + 1]
                     ),
                     **overrides,
                 )
