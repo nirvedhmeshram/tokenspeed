@@ -8,6 +8,10 @@ q/k/v/a/b per head group. The kernel addresses h0 rows via the runtime
 collapse to the previous hardcoded layout, so a dense call and a
 strided/sliced call over identical values must produce bitwise-identical
 outputs and state writes.
+
+``FusedSigmoidGatingPerHeadTest`` covers the M18c opt-① per-head absolute
+addressing path, where one launch reaches HV ssm heads scattered across k
+distinct slab tensors via per-head byte bases + a page table.
 """
 
 from __future__ import annotations
@@ -257,7 +261,6 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
         slab views. All slabs share one page_row_stride (same shape)."""
         torch = self.torch
         half = self.HV // self.KSHARDS
-        itemsize = slabs[0].element_size()
         page_row_stride = slabs[0].stride(0)  # elements per full (padded) row
         for slab in slabs:
             self.assertEqual(slab.stride(0), page_row_stride)
@@ -273,8 +276,52 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
             page_row_stride,
         )
 
-    def _per_shard_ref(self, inp, views, in_idx, **overrides):
-        """Retired path: one strided-h0 call per shard, outputs cat'd."""
+    def _per_shard_klaunch(self, inp, slabs, in_pages, **overrides):
+        """The retired shape: k launches, each per-head over one shard's heads
+        (head_shard renumbered to 0, a single-row page table). This is the
+        exact-same kernel specialization as the folded single launch, so the
+        fold must be bitwise-identical -- output AND fp32 state."""
+        torch = self.torch
+        half = self.HV // self.KSHARDS
+        ratio = self.HV // self.H
+        base_all, shard_all, prs = self._head_maps(slabs)
+        outs = []
+        for s in range(self.KSHARDS):
+            lo, hi = s * half, (s + 1) * half
+            outs.append(
+                self.fn(
+                    A_log=inp.A_log[lo:hi],
+                    dt_bias=inp.dt_bias[lo:hi],
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    q=inp.q[:, :, lo // ratio : hi // ratio],
+                    k=inp.k[:, :, lo // ratio : hi // ratio],
+                    v=inp.v[:, :, lo:hi],
+                    b=inp.b[..., lo:hi],
+                    a=inp.a[..., lo:hi],
+                    initial_state_source=slabs[s],
+                    initial_state_indices=None,
+                    cu_seqlens=inp.cu,
+                    use_qk_l2norm_in_kernel=True,
+                    head_base=base_all[lo:hi],
+                    head_shard=torch.zeros(half, dtype=torch.int32, device="cuda"),
+                    page_row_stride=prs,
+                    state_in_pages=in_pages[s : s + 1],
+                    state_out_pages=(
+                        overrides.pop("state_out_pages")[s : s + 1]
+                        if "state_out_pages" in overrides
+                        else None
+                    ),
+                    **overrides,
+                )
+            )
+        return torch.cat(outs, dim=2)
+
+    def _legacy_per_shard(self, inp, views, in_idx, **overrides):
+        """Legacy h0_source path (pre-M18c-opt): one strided-h0 call per shard.
+        A different kernel specialization from the int64-pointer path, so it
+        matches the folded launch only up to fp32 reassociation (1 ULP) on the
+        state; the returned output stays bitwise-identical."""
         torch = self.torch
         half = self.HV // self.KSHARDS
         ratio = self.HV // self.H
@@ -323,26 +370,21 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
             **overrides,
         )
 
-    def test_per_head_writeback_matches_per_shard(self):
-        """In-place write-back: single launch == per-shard loop, bitwise, both
-        for outputs and for the slab state written back."""
+    def test_fold_writeback_bitwise(self):
+        """The M18c fold: one per-head launch over HV heads == k per-head
+        launches over HV/k heads each, bitwise on output AND written-back
+        state. In-place write-back mode; one pad page (-1) must be skipped."""
         torch = self.torch
-        # One pad page (-1): the shard's read AND write-back must skip it.
         in_pages = torch.tensor(
             [[1, 3, -1, 2], [0, 3, -1, 1]], dtype=torch.int32, device="cuda"
         )
-
-        slabs_ref, views_ref = self._make_shards(self._inputs().h0)
-        slabs_new, views_new = self._make_shards(self._inputs().h0)
-        # Same seed -> identical inputs for both arms.
+        slabs_ref, _ = self._make_shards(self._inputs().h0)
+        slabs_new, _ = self._make_shards(self._inputs().h0)
         inp = self._inputs()
 
-        o_ref = self._per_shard_ref(inp, views_ref, in_pages)
+        o_ref = self._per_shard_klaunch(inp, slabs_ref, in_pages)
         o_new = self._per_head(
-            inp,
-            slabs_new[0],
-            *self._head_maps(slabs_new),
-            state_in_pages=in_pages,
+            inp, slabs_new[0], *self._head_maps(slabs_new), state_in_pages=in_pages
         )
 
         self.assertTrue(torch.equal(o_ref, o_new))
@@ -351,9 +393,9 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
             # Padding lanes between rows must never be touched.
             self.assertEqual(sn[:, 1].abs().max().item(), 0.0)
 
-    def test_per_head_output_pages_matches_per_shard(self):
-        """Flat decode mode: disable_state_update + out pages, state lands on
-        the out rows; single launch == per-shard loop, bitwise."""
+    def test_fold_output_pages_bitwise(self):
+        """Same fold in flat-decode mode: disable_state_update + out pages,
+        post-step state lands on the out rows. Bitwise output AND state."""
         torch = self.torch
         in_pages = torch.tensor(
             [[1, 3, -1, 2], [0, 3, -1, 1]], dtype=torch.int32, device="cuda"
@@ -361,38 +403,17 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
         out_pages = torch.tensor(
             [[4, 5, 6, -1], [4, 5, 6, -1]], dtype=torch.int32, device="cuda"
         )
-
-        slabs_ref, views_ref = self._make_shards(self._inputs().h0)
-        slabs_new, views_new = self._make_shards(self._inputs().h0)
+        slabs_ref, _ = self._make_shards(self._inputs().h0)
+        slabs_new, _ = self._make_shards(self._inputs().h0)
         inp = self._inputs()
 
-        # Per-shard reference: each shard consumes its own in/out page row.
-        half = self.HV // self.KSHARDS
-        ratio = self.HV // self.H
-        outs = []
-        for s in range(self.KSHARDS):
-            lo, hi = s * half, (s + 1) * half
-            outs.append(
-                self.fn(
-                    A_log=inp.A_log[lo:hi],
-                    dt_bias=inp.dt_bias[lo:hi],
-                    softplus_beta=1.0,
-                    softplus_threshold=20.0,
-                    q=inp.q[:, :, lo // ratio : hi // ratio],
-                    k=inp.k[:, :, lo // ratio : hi // ratio],
-                    v=inp.v[:, :, lo:hi],
-                    b=inp.b[..., lo:hi],
-                    a=inp.a[..., lo:hi],
-                    initial_state_source=views_ref[s],
-                    initial_state_indices=in_pages[s],
-                    cu_seqlens=inp.cu,
-                    use_qk_l2norm_in_kernel=True,
-                    disable_state_update=True,
-                    output_state_indices=out_pages[s],
-                )
-            )
-        o_ref = torch.cat(outs, dim=2)
-
+        o_ref = self._per_shard_klaunch(
+            inp,
+            slabs_ref,
+            in_pages,
+            state_out_pages=out_pages,
+            disable_state_update=True,
+        )
         o_new = self._per_head(
             inp,
             slabs_new[0],
@@ -407,7 +428,28 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
             self.assertTrue(torch.equal(sr, sn))
             self.assertEqual(sn[:, 1].abs().max().item(), 0.0)
 
-    def test_null_out_page_not_written(self):
+    def test_matches_legacy_path_output_bitwise_state_ulp(self):
+        """Cross-check against the retired h0_source path: the returned output
+        is bitwise-identical; the fp32 state written back matches to within one
+        ULP (the int64-pointer branch is a distinct kernel specialization whose
+        tl.sum reassociates -- bf16 output masks it, fp32 state exposes it)."""
+        torch = self.torch
+        in_pages = torch.tensor(
+            [[1, 3, -1, 2], [0, 3, -1, 1]], dtype=torch.int32, device="cuda"
+        )
+        slabs_leg, views_leg = self._make_shards(self._inputs().h0)
+        slabs_new, _ = self._make_shards(self._inputs().h0)
+        inp = self._inputs()
+
+        o_leg = self._legacy_per_shard(inp, views_leg, in_pages)
+        o_new = self._per_head(
+            inp, slabs_new[0], *self._head_maps(slabs_new), state_in_pages=in_pages
+        )
+
+        self.assertTrue(torch.equal(o_leg, o_new))
+        for sl, sn in zip(slabs_leg, slabs_new):
+            self.assertTrue(torch.allclose(sl, sn, rtol=0, atol=1e-6))
+            self.assertEqual(sn[:, 1].abs().max().item(), 0.0)
         """A request whose out page is -1 leaves every candidate row of every
         shard untouched (no dirty write through a stale base)."""
         torch = self.torch
