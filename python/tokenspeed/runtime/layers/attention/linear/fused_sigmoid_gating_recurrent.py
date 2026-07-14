@@ -51,6 +51,16 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_retrieve_parent_token_seq: tl.constexpr,
     stride_retrieve_parent_token_token: tl.constexpr,
     # ================================================
+    # Per-head absolute addressing (flat GDN: one launch covers a whole
+    # layer whose HV ssm heads live in k distinct K/V slab tensors, so a
+    # single h0_source base can't reach them). Unused when addressing by
+    # h0_source + h0_row_stride.
+    head_base_ptr,  # int64[HV] byte address of each head's ssm view
+    head_shard_ptr,  # int32[HV] which state_pages row pages the head
+    state_in_pages_ptr,  # int32[k, bs] in-page table
+    state_out_pages_ptr,  # int32[k, bs] out-page table
+    state_pages_row_stride,  # elements per page-table row (= bs)
+    page_row_stride,  # elements in one full page row (all slabs same shape)
     scale,
     T,
     stride_q,
@@ -75,6 +85,10 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     CACHE_INTERMEDIATE_STATES: tl.constexpr = False,
     HAS_OUTPUT_STATE_INDICES: tl.constexpr = False,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr = False,
+    # Flat GDN: address each head by its own slab base + page offset.
+    USE_PER_HEAD_ADDRESSING: tl.constexpr = False,
+    HAS_STATE_IN_PAGES: tl.constexpr = False,
+    HAS_STATE_OUT_PAGES: tl.constexpr = False,
 ):
     """
     Fused kernel that combines sigmoid gating computation with recurrent delta rule update.
@@ -113,7 +127,24 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_h = mask_k[:, None] & mask_v[None, :]
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
-    if USE_INITIAL_STATE:
+    if USE_PER_HEAD_ADDRESSING:
+        # Head i_hv's ssm view lives in its own slab tensor; head_base is
+        # that view's byte address (h0_source carries only the state dtype),
+        # in_page picks a row of that slab. Hoisted for the output write too.
+        state_ty = h0_source.dtype.element_ty
+        head_base = tl.load(head_base_ptr + i_hv).to(tl.pointer_type(state_ty))
+        sh = tl.load(head_shard_ptr + i_hv)
+        if HAS_STATE_IN_PAGES:
+            in_page = tl.load(state_in_pages_ptr + sh * state_pages_row_stride + i_n)
+            if in_page >= 0:
+                p_h0 = (
+                    head_base
+                    + in_page.to(tl.int64) * page_row_stride
+                    + o_k[:, None] * V
+                    + o_v[None, :]
+                )
+                b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+    elif USE_INITIAL_STATE:
         idx = tl.load(h0_indices + i_n)
         if idx >= 0:
             # h0_source rows may be non-contiguous strided views (flat GDN
@@ -184,7 +215,25 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
         # Cache intermediate states if enabled
-        if HAS_OUTPUT_STATE_INDICES:
+        if USE_PER_HEAD_ADDRESSING:
+            # Flat decode writes the post-step state to the head's out page
+            # (T == 1, so one out page per request). in_page < 0 heads have
+            # nothing seeded and nothing to persist.
+            if HAS_STATE_OUT_PAGES:
+                out_page = tl.load(
+                    state_out_pages_ptr + sh * state_pages_row_stride + i_n
+                )
+                if out_page >= 0:
+                    output_ptr = (
+                        head_base
+                        + out_page.to(tl.int64) * page_row_stride
+                        + o_k[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(
+                        output_ptr, b_h.to(output_ptr.dtype.element_ty), mask=mask_h
+                    )
+        elif HAS_OUTPUT_STATE_INDICES:
             out_idx = tl.load(output_state_indices + i_n * T + step_idx).to(tl.int64)
             if out_idx >= 0:
                 output_ptr = (
@@ -220,7 +269,23 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     # Store final state back to h0_source with bounds checking
     if not DISABLE_STATE_UPDATE:
-        if USE_INITIAL_STATE:
+        if USE_PER_HEAD_ADDRESSING:
+            # In-place write-back to the head's in page (mirrors the legacy
+            # h0 write-back); flat decode uses DISABLE_STATE_UPDATE + out
+            # pages instead, so this only fires for an in-place caller.
+            if HAS_STATE_IN_PAGES:
+                in_page = tl.load(
+                    state_in_pages_ptr + sh * state_pages_row_stride + i_n
+                )
+                if in_page >= 0:
+                    p_h0 = (
+                        head_base
+                        + in_page.to(tl.int64) * page_row_stride
+                        + o_k[:, None] * V
+                        + o_v[None, :]
+                    )
+                    tl.store(p_h0, b_h.to(p_h0.dtype.element_ty), mask=mask_h)
+        elif USE_INITIAL_STATE:
             idx = tl.load(h0_indices + i_n)
             if idx >= 0:
                 p_h0 = (
@@ -254,6 +319,16 @@ def fused_sigmoid_gating_delta_rule_update(
     cache_steps: int | None = None,
     output_state_indices: torch.Tensor | None = None,
     retrieve_parent_token: torch.Tensor | None = None,
+    # Flat GDN per-head absolute addressing: one launch covers a whole
+    # layer whose HV ssm heads scatter across k K/V slab tensors, so no
+    # single initial_state_source base reaches them. When head_base is
+    # given the kernel addresses each head by its own byte base + page,
+    # and initial_state_source serves only as the state-dtype carrier.
+    head_base: torch.Tensor | None = None,
+    head_shard: torch.Tensor | None = None,
+    state_in_pages: torch.Tensor | None = None,
+    state_out_pages: torch.Tensor | None = None,
+    page_row_stride: int | None = None,
 ):
     """
     Fused triton implementation of sigmoid gating delta rule update.
@@ -272,11 +347,45 @@ def fused_sigmoid_gating_delta_rule_update(
     stride_b = b.stride()[-2]
     stride_a = a.stride()[-2]
     HV = v.shape[2]
+    use_per_head = head_base is not None
+    state_pages_row_stride = 0
+    if use_per_head:
+        # Per-head mode: initial_state_source is only the state-dtype
+        # carrier (each head reaches its own slab via head_base), so the
+        # dense (HV, K, V) layout check below doesn't apply. Validate the
+        # per-head maps instead.
+        if initial_state_source is None:
+            raise ValueError(
+                "per-head addressing needs initial_state_source as the "
+                "state-dtype carrier"
+            )
+        for name, t in (("head_base", head_base), ("head_shard", head_shard)):
+            if t is None:
+                raise ValueError(f"per-head addressing requires {name}")
+            if t.ndim != 1 or t.shape[0] != HV:
+                raise ValueError(
+                    f"{name} must be 1-D of length HV={HV}; got " f"{tuple(t.shape)}"
+                )
+        for name, t in (
+            ("state_in_pages", state_in_pages),
+            ("state_out_pages", state_out_pages),
+        ):
+            if t is not None and t.ndim != 2:
+                raise ValueError(f"{name} must be 2-D [k, bs]; got {tuple(t.shape)}")
+        if page_row_stride is None:
+            raise ValueError("per-head addressing requires page_row_stride")
+        state_pages = state_in_pages if state_in_pages is not None else state_out_pages
+        if state_pages is None:
+            raise ValueError(
+                "per-head addressing requires state_in_pages or state_out_pages"
+            )
+        state_pages_row_stride = state_pages.stride(0)
+        h0_row_stride = 0
     # h0 rows may be non-contiguous strided views (flat GDN state shards
     # over the K/V slabs): dim 0 strides a whole page row. The kernel
     # addresses rows by h0_row_stride but keeps the dense in-row layout
     # (i_hv*K*V + o_k*V + o_v), so each row must stay inner-contiguous.
-    if initial_state_source is not None:
+    elif initial_state_source is not None:
         src_hv, src_k, src_v = initial_state_source.shape[-3:]
         if initial_state_source.stride()[-3:] != (src_k * src_v, src_v, 1):
             raise ValueError(
@@ -339,6 +448,12 @@ def fused_sigmoid_gating_delta_rule_update(
         retrieve_parent_token_ptr=retrieve_parent_token,
         stride_retrieve_parent_token_seq=stride_retrieve_parent_token_seq,
         stride_retrieve_parent_token_token=stride_retrieve_parent_token_token,
+        head_base_ptr=head_base,
+        head_shard_ptr=head_shard,
+        state_in_pages_ptr=state_in_pages,
+        state_out_pages_ptr=state_out_pages,
+        state_pages_row_stride=state_pages_row_stride if use_per_head else 0,
+        page_row_stride=page_row_stride if use_per_head else 0,
         scale=scale,
         T=T,
         stride_q=stride_q,
@@ -362,6 +477,9 @@ def fused_sigmoid_gating_delta_rule_update(
         CACHE_INTERMEDIATE_STATES=intermediate_states_buffer is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_parent_token is not None,
+        USE_PER_HEAD_ADDRESSING=use_per_head,
+        HAS_STATE_IN_PAGES=use_per_head and state_in_pages is not None,
+        HAS_STATE_OUT_PAGES=use_per_head and state_out_pages is not None,
         num_warps=num_warps,
         num_stages=num_stages,
     )
