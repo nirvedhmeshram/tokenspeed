@@ -541,6 +541,30 @@ class HeadAddressingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contiguously"):
             head_addressing_maps(holed, ssm_head_elems=SSM_HEAD_ELEMS)
 
+    def test_dropped_tail_head_group_raises(self):
+        # Use tp1's 8-groups-per-layer table so a state layer has a genuine tail
+        # group (head_begin=28) to drop; the survivors still tile [0, 28)
+        # contiguously, so only the tail-coverage check can catch the loss.
+        kw = dict(
+            num_full_layers=1,
+            num_state_layers=30,
+            ssm_heads_per_layer=32,
+            ssm_head_bytes=65536,
+            conv_bytes_per_layer=49152,
+            kv_cell_bytes_per_tok=2048,
+            block_size=256,
+        )
+        bt = shard_bin_table(**kw)
+        last_begin = max(e.head_begin for e in bt.ssm_entries if e.state_layer == 0)
+        pruned = tuple(
+            e
+            for e in bt.ssm_entries
+            if not (e.state_layer == 0 and e.head_begin == last_begin)
+        )
+        docked = dataclasses.replace(bt, ssm_entries=pruned)
+        with self.assertRaisesRegex(ValueError, "tail head group is missing"):
+            head_addressing_maps(docked, ssm_head_elems=SSM_HEAD_ELEMS)
+
     def test_single_shard_degenerate_flat_offsets(self):
         # k=1: one segment holds all heads of a layer (heads_per_group >= heads),
         # so every head maps to shard 0 with a plain per-cell stride.

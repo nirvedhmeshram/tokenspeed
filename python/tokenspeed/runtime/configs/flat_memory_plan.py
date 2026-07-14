@@ -339,6 +339,15 @@ def shard_bin_table(
 @dataclass(frozen=True)
 class StateLayerHeadMap:
     # Each field's length == that state layer's ssm head count (heads_per_layer).
+    #
+    # WARNING: (head_shard, head_elem_offset) is NOT an absolute address. The K
+    # and V segments of one state layer are packed into distinct slab rows that
+    # both start at byte_offset 0, so a K-side head and a V-side head can share
+    # the very same (shard, elem_offset) yet point at different memory. Resolve
+    # the base with the per-head ssm view's data_ptr() (which already encodes
+    # kv_side / slot / in-row byte offset); head_shard here only selects which
+    # runtime page-table row of state_pages to read, and head_elem_offset is for
+    # validation/asserts, not addressing.
     head_shard: tuple[
         int, ...
     ]  # head h's page row = this row of state_pages (= entry.shard)
@@ -354,6 +363,15 @@ def head_addressing_maps(bin_table, *, ssm_head_elems):
     a group at byte_offset b (ssm dtype itemsize s) sits at element offset
     (b // s) + (h - head_begin) * ssm_head_elems within that shard's slab row.
     Returns list indexed by state-layer occurrence order (len = num_state_layers).
+
+    WARNING: the returned (head_shard, head_elem_offset) pair is NOT an absolute
+    address. Because each state layer's K and V segments occupy separate slab
+    rows that both begin at byte_offset 0, a head on the K side and a head on the
+    V side can carry identical (shard, elem_offset) while aliasing distinct
+    memory. The consumer MUST take the base from each head's ssm view data_ptr()
+    (it already encodes kv_side / slot / segment offset); head_shard is only for
+    picking the state_pages runtime page-table row, and head_elem_offset is only
+    a validation/assert aid.
 
     Args:
         bin_table: StateShardBinTable.
@@ -371,7 +389,8 @@ def head_addressing_maps(bin_table, *, ssm_head_elems):
             order.append(e.state_layer)
         by_layer[e.state_layer].append(e)
 
-    maps: list[StateLayerHeadMap] = []
+    # (layer, sorted entries, expanded lists, tail head count) per state layer.
+    expanded: list[tuple[int, int, list[int], list[int]]] = []
     for layer in order:
         head_shard: list[int] = []
         head_elem_offset: list[int] = []
@@ -383,9 +402,18 @@ def head_addressing_maps(bin_table, *, ssm_head_elems):
                     f"contiguously; expected head_begin {next_head}, got "
                     f"{e.head_begin}"
                 )
+            if e.num_heads < 1:
+                raise ValueError(
+                    f"state layer {layer}: ssm entry has num_heads {e.num_heads}"
+                )
             # byte_offset is bytes; recover ssm dtype itemsize from this entry so
             # the pure function need not know the dtype: one head is nbytes//num_heads
             # bytes = itemsize * ssm_head_elems elements.
+            if e.nbytes % e.num_heads != 0:
+                raise ValueError(
+                    f"state layer {layer}: entry nbytes {e.nbytes} is not divisible "
+                    f"by num_heads {e.num_heads}"
+                )
             head_bytes = e.nbytes // e.num_heads
             itemsize = head_bytes // ssm_head_elems
             if itemsize < 1 or itemsize * ssm_head_elems != head_bytes:
@@ -398,6 +426,24 @@ def head_addressing_maps(bin_table, *, ssm_head_elems):
                 head_shard.append(e.shard)
                 head_elem_offset.append(elem_base + h * ssm_head_elems)
             next_head += e.num_heads
+        # next_head == last group's (head_begin + num_heads): head order tiles
+        # [0, next_head). The prefix check above already forbids interior gaps,
+        # so the only remaining failure is a dropped *tail* group -> a short map.
+        expanded.append((layer, next_head, head_shard, head_elem_offset))
+
+    # Tail-coverage: every state layer of a model carries the same ssm head
+    # count, so the expected upper bound is the largest per-layer head total.
+    # A layer whose last group was dropped tiles [0, short) cleanly yet expands
+    # to fewer heads than its peers -> caught here (never silently truncated).
+    expected_heads = max(total for _, total, _, _ in expanded)
+    maps: list[StateLayerHeadMap] = []
+    for layer, total, head_shard, head_elem_offset in expanded:
+        if total != expected_heads:
+            raise ValueError(
+                f"state layer {layer}: ssm head groups cover only heads "
+                f"[0, {total}) but layers reach [0, {expected_heads}); a tail "
+                f"head group is missing"
+            )
         maps.append(
             StateLayerHeadMap(
                 head_shard=tuple(head_shard),
