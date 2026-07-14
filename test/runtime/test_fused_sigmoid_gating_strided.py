@@ -453,6 +453,8 @@ class FusedSigmoidGatingPerHeadTest(unittest.TestCase):
         for sl, sn in zip(slabs_leg, slabs_new):
             self.assertTrue(torch.allclose(sl, sn, rtol=0, atol=1e-6))
             self.assertEqual(sn[:, 1].abs().max().item(), 0.0)
+
+    def test_out_page_negative_one_leaves_all_shards_untouched(self):
         """A request whose out page is -1 leaves every candidate row of every
         shard untouched (no dirty write through a stale base)."""
         torch = self.torch

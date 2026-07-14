@@ -366,12 +366,27 @@ def fused_sigmoid_gating_delta_rule_update(
                 raise ValueError(
                     f"{name} must be 1-D of length HV={HV}; got " f"{tuple(t.shape)}"
                 )
+        if head_base.dtype != torch.int64:
+            raise ValueError(f"head_base must be int64; got {head_base.dtype}")
+        if head_shard.dtype != torch.int32:
+            raise ValueError(f"head_shard must be int32; got {head_shard.dtype}")
         for name, t in (
             ("state_in_pages", state_in_pages),
             ("state_out_pages", state_out_pages),
         ):
             if t is not None and t.ndim != 2:
                 raise ValueError(f"{name} must be 2-D [k, bs]; got {tuple(t.shape)}")
+        # The kernel indexes both page tables with one state_pages_row_stride,
+        # so a mismatched row stride would silently corrupt the out table.
+        if (
+            state_in_pages is not None
+            and state_out_pages is not None
+            and state_in_pages.stride(0) != state_out_pages.stride(0)
+        ):
+            raise ValueError(
+                "state_in_pages and state_out_pages must share row stride; got "
+                f"{state_in_pages.stride(0)} vs {state_out_pages.stride(0)}"
+            )
         if page_row_stride is None:
             raise ValueError("per-head addressing requires page_row_stride")
         state_pages = state_in_pages if state_in_pages is not None else state_out_pages
@@ -379,6 +394,22 @@ def fused_sigmoid_gating_delta_rule_update(
             raise ValueError(
                 "per-head addressing requires state_in_pages or state_out_pages"
             )
+        # sh (a head_shard value) indexes page-table rows; i_n indexes columns.
+        n_req = B if cu_seqlens is None else len(cu_seqlens) - 1
+        if state_pages.shape[1] < n_req:
+            raise ValueError(
+                f"page table has {state_pages.shape[1]} columns; need >= "
+                f"{n_req} requests"
+            )
+        # head_shard.max() reads device memory, illegal under graph capture;
+        # the k bound is static per launch, so skip it while capturing.
+        if not torch.cuda.is_current_stream_capturing():
+            k_rows = int(head_shard.max().item()) + 1
+            if state_pages.shape[0] < k_rows:
+                raise ValueError(
+                    f"page table has {state_pages.shape[0]} rows; head_shard "
+                    f"selects up to row {k_rows - 1}"
+                )
         state_pages_row_stride = state_pages.stride(0)
         h0_row_stride = 0
     # h0 rows may be non-contiguous strided views (flat GDN state shards
