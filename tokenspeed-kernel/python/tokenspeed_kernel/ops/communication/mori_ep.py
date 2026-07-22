@@ -98,6 +98,45 @@ def masked_grouped_gemm(
     return out
 
 
+# MXFP4 (E2M1) code -> value lookup; 2 codes packed per uint8 (low nibble first).
+_E2M1_LUT = None
+
+
+def dequant_mxfp4(packed: torch.Tensor, scale_e8m0: torch.Tensor, group_size: int = 32) -> torch.Tensor:
+    """Dequantize MXFP4 weights to bf16. packed [..., K//2] uint8 (2 fp4/byte, lo=first),
+    scale_e8m0 [..., K//group_size] uint8 (biased +127) -> bf16 [..., K].
+
+    Validated round-trip (bf16->mxfp4->bf16) cos~0.99. Used to reuse the bf16 grouped-GEMM
+    for the MORI MXFP4 path (correctness-first; a native mxfp4 grouped-GEMM is the perf follow-on).
+    """
+    global _E2M1_LUT
+    if _E2M1_LUT is None or _E2M1_LUT.device != packed.device:
+        _E2M1_LUT = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=packed.device, dtype=torch.bfloat16,
+        )
+
+    def _one(p2d: torch.Tensor, s2d: torch.Tensor) -> torch.Tensor:
+        # p2d [R, K//2] uint8, s2d [R, K//32] uint8 -> [R, K] bf16
+        lo = (p2d & 0xF).to(torch.int32)
+        hi = ((p2d >> 4) & 0xF).to(torch.int32)
+        codes = torch.stack([lo, hi], dim=-1).reshape(p2d.shape[0], -1)   # [R, K] int32
+        vals = _E2M1_LUT[codes]                                           # [R, K] bf16
+        sc = torch.exp2(s2d.to(torch.bfloat16) - 127).repeat_interleave(group_size, dim=-1)
+        return vals * sc[:, : vals.shape[-1]]
+
+    if packed.dim() == 2:
+        return _one(packed, scale_e8m0)
+    # [E, R, K//2] -> loop experts to bound transient memory (avoid a full [E,R,K] int64 blowup)
+    E = packed.shape[0]
+    out = torch.empty(
+        (E, packed.shape[1], packed.shape[2] * 2), dtype=torch.bfloat16, device=packed.device
+    )
+    for e in range(E):
+        out[e] = _one(packed[e], scale_e8m0[e])
+    return out
+
+
 class MoriEpDispatcher:
     """MORI v2 dispatch/combine for one MoE layer-group shape.
 
