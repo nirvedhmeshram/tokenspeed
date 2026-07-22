@@ -3,21 +3,19 @@
 # SPDX-License-Identifier: MIT
 """AMD-native EP dispatch/combine backed by MORI (github.com/ROCm/mori).
 
-MORI-EP provides production dispatch/combine kernels for MoE expert parallelism on
-AMD GPUs (IntraNode over XGMI, InterNode over RDMA) — real all-to-all, unlike the
-masked-replicate ``all2all_backend=none`` fallback. This module adapts MORI's
-``EpDispatchCombineOp`` to tokenspeed's MoE expert path.
+Uses MORI's v2 op API (``mori.ops.dispatch_combine_v2``) — the maintained
+standard-MoE (DeepEP-style) path. The v1 ``dispatch_standard_moe``/convert path
+is broken in current builds; basic v1 dispatch/combine works but only for the 2D
+(ungrouped) case. v2 gives the grouped ``[num_local_experts, cap, hidden]`` layout
+that a masked grouped-GEMM consumes.
+
+Validated end-to-end on gfx950 (dispatch -> convert_dispatch_output -> masked
+grouped-GEMM -> convert_combine_input -> combine) vs a reference MoE: cos=1.0.
+
+Requires: `pip install -e ~/mori` (ENABLE_STANDARD_MOE_ADAPT=ON), `pip install flydsl`,
+and `ROCM_PATH` -> a hipcc that supports `--genco` (see the rocm-local overlay).
 
 Selected when ``--all2all-backend mori`` (``All2AllBackend.MORI``) + expert parallel.
-
-Validated usage (mirrors MORI's own intranode test, zero-copy path):
-    d_out, d_w, d_s, d_idx, recv = op.dispatch(x, topk_w, scales, topk_ids)
-    cbuf = op.get_registered_combine_input_buffer(dtype)   # expert output written here
-    cbuf[:n].copy_(expert_out[:n])                          # (identity example)
-    out, _ = op.combine(d_out, d_w, topk_ids, call_reset=False)  # original topk_ids, dispatch weights
-
-Requires: `pip install -e ~/mori` (built ENABLE_STANDARD_MOE_ADAPT=ON) and
-`ROCM_PATH` pointing at a hipcc that supports `--genco` for the target arch.
 """
 from __future__ import annotations
 
@@ -31,51 +29,83 @@ import torch.distributed as dist
 logger = logging.getLogger(__name__)
 
 _MORI_AVAILABLE = None
-_SHMEM_INITED = False
+_COMM = None  # process-wide mori.cco.Communicator singleton
 
 
 def mori_available() -> bool:
-    """True if the `mori` package (with EP ops) can be imported."""
+    """True if MORI v2 EP ops (and flydsl) can be imported."""
     global _MORI_AVAILABLE
     if _MORI_AVAILABLE is None:
         try:
-            import mori  # noqa: F401
-            import mori.ops  # noqa: F401
-            import mori.shmem  # noqa: F401
+            import flydsl  # noqa: F401
+            from mori.cco import Communicator  # noqa: F401
+            from mori.ops.dispatch_combine_v2 import (  # noqa: F401
+                EpDispatchCombineConfig,
+                EpDispatchCombineOp,
+            )
 
             _MORI_AVAILABLE = True
         except Exception as e:  # pragma: no cover
-            logger.warning("MORI not available: %s", e)
+            logger.warning("MORI v2 EP not available: %s", e)
             _MORI_AVAILABLE = False
     return _MORI_AVAILABLE
 
 
-def ensure_mori_shmem(group_name: str = "default", heap_size: str | None = None) -> None:
-    """Initialize MORI symmetric memory once, bound to a torch process group.
+def ensure_mori_comm(per_rank_vmm: int | None = None):
+    """Create the process-wide MORI CCO Communicator once (uid broadcast over the
+    world group). torch.distributed must already be initialized. Returns the comm."""
+    global _COMM
+    if _COMM is not None:
+        return _COMM
+    from mori.cco import Communicator
 
-    torch.distributed must already be initialized. Idempotent per process.
+    assert dist.is_initialized(), "torch.distributed must be initialized before MORI comm init"
+    rank = dist.get_rank()
+    uid = Communicator.get_unique_id() if rank == 0 else None
+    objs = [uid]
+    dist.broadcast_object_list(objs, src=0)
+    uid = objs[0]
+    if per_rank_vmm is None:
+        per_rank_vmm = int(os.environ.get("MORI_PER_RANK_VMM", str(4 << 30)))  # 4 GiB default
+    _COMM = Communicator.init(dist.get_world_size(), rank, uid, per_rank_vmm=per_rank_vmm)
+    return _COMM
+
+
+def masked_grouped_gemm(
+    packed_x: torch.Tensor,   # [E_local, cap, hidden]  (dispatched tokens grouped by local expert)
+    counts: torch.Tensor,     # [E_local] int32         (valid rows per expert)
+    w13: torch.Tensor,        # [E_local, 2*I, hidden]  gate rows [0:I], up [I:2I]
+    w2: torch.Tensor,         # [E_local, hidden, I]
+) -> torch.Tensor:
+    """Per-expert SwiGLU FFN over the first counts[e] rows of each expert slot; padding -> 0.
+    Pure FFN (combine applies the top-k weighting). Returns packed_out [E_local, cap, hidden].
+
+    NOTE: naive per-expert loop for correctness. TODO(perf): replace with a Triton/gluon
+    masked grouped-GEMM (gluon stage1/stage2 already do per-expert padded grouped GEMM +
+    counts — the same layout as ``packed_x`` — so this is a re-plumbing, not a new algorithm).
     """
-    global _SHMEM_INITED
-    if _SHMEM_INITED:
-        return
-    import mori  # noqa: E402
-
-    if heap_size:
-        os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", heap_size)
-    assert dist.is_initialized(), "torch.distributed must be initialized before MORI shmem init"
-    # Register the (world) process group under `group_name` so MORI can bootstrap
-    # its symmetric heap over it.
-    torch._C._distributed_c10d._register_process_group(group_name, dist.group.WORLD)
-    mori.shmem.shmem_torch_process_group_init(group_name)
-    _SHMEM_INITED = True
+    E, cap, H = packed_x.shape
+    I = w13.shape[1] // 2
+    out = torch.zeros_like(packed_x)
+    for e in range(E):
+        n = int(counts[e].item())
+        if n == 0:
+            continue
+        h = packed_x[e, :n].float()                              # [n, H]
+        gate_up = h @ w13[e].float().t()                        # [n, 2I]
+        inter = torch.nn.functional.silu(gate_up[:, :I]) * gate_up[:, I:]   # [n, I]
+        out[e, :n] = (inter @ w2[e].float().t()).to(packed_x.dtype)
+    return out
 
 
 class MoriEpDispatcher:
-    """Thin wrapper over ``mori.ops.EpDispatchCombineOp`` for one MoE layer group.
+    """MORI v2 dispatch/combine for one MoE layer-group shape.
 
-    One instance owns a MORI op configured for a fixed (world_size, hidden, experts,
-    capacity) shape. dispatch() routes tokens to expert owners; combine() gathers and
-    weight-sums expert outputs back to origin tokens.
+    Usage (mirrors the registered kernel):
+        h = disp.dispatch(hidden, topk_weights, topk_ids)
+        packed = h["packed_x"]                                   # [E_local, cap, H]
+        packed.copy_(masked_grouped_gemm(packed, h["counts"], w13, w2))   # GEMM in place
+        out = disp.combine(h)                                    # [num_tokens, H]
     """
 
     def __init__(
@@ -87,108 +117,47 @@ class MoriEpDispatcher:
         num_experts_per_token: int,
         max_num_inp_token_per_rank: int,
         data_type: torch.dtype = torch.bfloat16,
-        gpu_per_node: int | None = None,
-        scale_dim: int = 0,
-        kernel_type: str = "intranode",  # "intranode" | "intranode_ll" | "internode" | ...
     ) -> None:
-        assert mori_available(), "MORI is not importable; cannot build MoriEpDispatcher"
-        import mori
+        assert mori_available(), "MORI v2 EP not importable"
+        from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
 
-        ensure_mori_shmem()
-
-        kt = {
-            "intranode": mori.ops.EpDispatchCombineKernelType.IntraNode,
-            "intranode_ll": mori.ops.EpDispatchCombineKernelType.IntraNodeLL,
-            "internode": mori.ops.EpDispatchCombineKernelType.InterNode,
-            "internode_v1": mori.ops.EpDispatchCombineKernelType.InterNodeV1,
-            "internode_v1_ll": mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-            "asyncll": mori.ops.EpDispatchCombineKernelType.AsyncLL,
-        }[kernel_type]
-
-        # gpu_per_node must be a power of 2 and divide world_size (MORI assertion).
-        # Single-node EP<8: gpu_per_node = world_size.
-        if gpu_per_node is None:
-            gpu_per_node = world_size if world_size <= 8 else 8
-
-        self.data_type = data_type
-        self.num_experts_per_token = num_experts_per_token
-        self._cfg = mori.ops.EpDispatchCombineConfig(
-            data_type=data_type,
+        comm = ensure_mori_comm()
+        self._cfg = EpDispatchCombineConfig(
             rank=rank,
             world_size=world_size,
             hidden_dim=hidden_dim,
-            scale_dim=scale_dim,
-            scale_type_size=torch.tensor([], dtype=torch.float8_e4m3fnuz).element_size(),
-            max_token_type_size=torch.tensor([], dtype=torch.float32).element_size(),
             max_num_inp_token_per_rank=max_num_inp_token_per_rank,
             num_experts_per_rank=num_local_experts,
             num_experts_per_token=num_experts_per_token,
-            kernel_type=kt,
-            gpu_per_node=gpu_per_node,
-            use_external_inp_buf=False,  # zero-copy: expert writes into registered buffer
+            data_type=data_type,
+            enable_std_moe=True,
         )
-        self._op = mori.ops.EpDispatchCombineOp(self._cfg)
+        self._op = EpDispatchCombineOp(self._cfg, comm)
 
     def dispatch(
         self,
         hidden_states: torch.Tensor,   # [num_tokens, hidden]
-        topk_weights: torch.Tensor,    # [num_tokens, topk]  fp32
-        topk_ids: torch.Tensor,        # [num_tokens, topk]  int32 (global expert ids)
+        topk_weights: torch.Tensor,    # [num_tokens, topk] fp32
+        topk_ids: torch.Tensor,        # [num_tokens, topk] (global expert ids)
         scales: torch.Tensor | None = None,
-        block_num: int = 80,
-        warp_per_block: int = 16,
     ) -> dict[str, Any]:
-        """Route tokens to their experts' owner ranks.
-
-        Returns a handle dict with the received tokens and metadata. The caller runs
-        local expert compute writing results into ``combine_input_buffer`` (zero-copy),
-        then calls :meth:`combine` with the SAME ``topk_ids``.
-        """
-        if scales is None:
-            scales = torch.empty(
-                hidden_states.size(0), 0, dtype=torch.float8_e4m3fnuz, device=hidden_states.device
-            )
-        d_out, d_w, d_s, d_idx, recv = self._op.dispatch(
-            hidden_states, topk_weights, scales, topk_ids.to(torch.int32),
-            block_num=block_num, warp_per_block=warp_per_block,
+        recv_x, _ow, _os, _oi, total_recv, routing = self._op.dispatch(
+            hidden_states, topk_weights, scales, topk_ids.to(torch.int32), return_routing=True
         )
+        packed_x, counts, packed_src = self._op.convert_dispatch_output()
         return {
-            "recv_hidden": d_out,        # [recv_capacity, hidden]; first recv_num valid
-            "recv_weights": d_w,
-            "recv_scales": d_s,
-            "recv_indices": d_idx,
-            "recv_num": int(recv[0].item()),
-            "block_num": block_num,
-            "warp_per_block": warp_per_block,
+            "recv_x": recv_x,          # combine's input buffer handle
+            "packed_x": packed_x,      # [E_local, cap, hidden]; write expert output here in place
+            "counts": counts,          # [E_local] per-expert valid-row counts
+            "routing": routing,
+            "total_recv": int(total_recv.cpu().item()),
         }
 
-    def combine_input_buffer(self) -> torch.Tensor:
-        """The registered buffer the caller writes local expert outputs into (zero-copy)."""
-        return self._op.get_registered_combine_input_buffer(self.data_type)
-
-    def combine(
-        self,
-        recv_hidden: torch.Tensor,     # the dispatch handle's recv_hidden (buffer handle)
-        recv_weights: torch.Tensor,    # dispatch-returned weights
-        topk_ids: torch.Tensor,        # ORIGINAL topk_ids (same as dispatch input)
-        block_num: int = 80,
-        warp_per_block: int = 16,
-    ) -> torch.Tensor:
-        """Gather expert outputs back to origin tokens, weight-summed. Returns [num_tokens, hidden]."""
-        out, _ = self._op.combine(
-            recv_hidden, recv_weights, topk_ids.to(torch.int32),
-            block_num=block_num, warp_per_block=warp_per_block, call_reset=False,
-        )
+    def combine(self, handle: dict[str, Any]) -> torch.Tensor:
+        """Reduce grouped expert outputs back to origin tokens (applies top-k weights)."""
+        self._op.convert_combine_input(handle["routing"])
+        out, _ = self._op.combine(handle["recv_x"], routing=handle["routing"])
         return out
 
     def reset(self) -> None:
         self._op.reset()
-
-
-# TODO(M3/M4): the registered MoE `apply` kernel (mirroring
-# ops/moe/flashinfer/cutedsl_deepep_nvfp4.py) wires: dispatch() -> local masked
-# grouped-GEMM over recv tokens grouped by local expert (reuse gluon_bf16_moe /
-# mxfp4 per the M0 decision; MORI's convert_dispatch_output gives the 3D
-# [experts, capacity, hidden] + per-expert counts layout that grouped-GEMM wants)
-# -> combine(). Register gated vendors={"amd"}, supports_all_to_all_ep={True},
-# priority above triton_mxfp4_ep_precomputed_moe_apply.
