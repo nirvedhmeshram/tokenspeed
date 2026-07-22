@@ -47,7 +47,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep"}:
+    if a2a_backend in {None, "none", "deepep", "mori"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
@@ -133,6 +133,8 @@ def moe_plan(
     _validate_a2a_backend(a2a_backend)
     if solution is None and a2a_backend == "deepep":
         solution = "flashinfer_cutedsl_deepep"
+    if solution is None and a2a_backend == "mori":
+        solution = "mori"
 
     traits = _build_traits(
         weight_dtype=weight_dtype,
