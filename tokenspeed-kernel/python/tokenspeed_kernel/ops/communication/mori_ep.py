@@ -161,3 +161,44 @@ class MoriEpDispatcher:
 
     def reset(self) -> None:
         self._op.reset()
+
+
+# All MoE layers in a model share the same EP shape (hidden, local experts, top-k),
+# so they should share ONE dispatcher/op — otherwise each of the N layers allocates
+# its own MORI symmetric buffers (N x memory -> OOM on large models). Keyed by shape;
+# sequential eager reuse across layers is safe (each dispatch re-populates buffers).
+_DISPATCHER_CACHE: dict[tuple, "MoriEpDispatcher"] = {}
+
+
+def get_dispatcher(
+    rank: int,
+    world_size: int,
+    hidden_dim: int,
+    num_local_experts: int,
+    num_experts_per_token: int,
+    max_num_inp_token_per_rank: int,
+    data_type: torch.dtype = torch.bfloat16,
+) -> "MoriEpDispatcher":
+    """Return a process-wide MoriEpDispatcher for this EP shape, creating it once."""
+    key = (
+        rank,
+        world_size,
+        hidden_dim,
+        num_local_experts,
+        num_experts_per_token,
+        max_num_inp_token_per_rank,
+        str(data_type),
+    )
+    disp = _DISPATCHER_CACHE.get(key)
+    if disp is None:
+        disp = MoriEpDispatcher(
+            rank=rank,
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            num_local_experts=num_local_experts,
+            num_experts_per_token=num_experts_per_token,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            data_type=data_type,
+        )
+        _DISPATCHER_CACHE[key] = disp
+    return disp

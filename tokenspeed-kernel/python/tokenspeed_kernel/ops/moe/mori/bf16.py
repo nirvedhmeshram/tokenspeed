@@ -26,7 +26,7 @@ platform = current_platform()
 
 if platform.is_amd:
     from tokenspeed_kernel.ops.communication.mori_ep import (
-        MoriEpDispatcher,
+        get_dispatcher,
         masked_grouped_gemm,
     )
 
@@ -80,24 +80,22 @@ if platform.is_amd:
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        dispatcher = plan.get("_mori_ep_dispatcher")
-        if dispatcher is None:
-            ep_size = int(getattr(w, "ep_size", dist.get_world_size()))
-            ep_rank = int(getattr(w, "ep_rank", dist.get_rank()))
-            num_local = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
-            # Fixed dispatch capacity (per rank). Must upper-bound tokens/rank across
-            # all calls; MORI allocates symmetric buffers for this at op creation.
-            cap = int(max_num_tokens_per_gpu or x.shape[0])
-            dispatcher = MoriEpDispatcher(
-                rank=ep_rank,
-                world_size=ep_size,
-                hidden_dim=x.shape[1],
-                num_local_experts=num_local,
-                num_experts_per_token=int(getattr(w, "top_k")),
-                max_num_inp_token_per_rank=cap,
-                data_type=torch.bfloat16,
-            )
-            plan["_mori_ep_dispatcher"] = dispatcher
+        ep_size = int(getattr(w, "ep_size", dist.get_world_size()))
+        ep_rank = int(getattr(w, "ep_rank", dist.get_rank()))
+        num_local = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
+        # Fixed dispatch capacity (per rank). Must upper-bound tokens/rank across all
+        # calls; MORI allocates symmetric buffers for this at op creation. One
+        # dispatcher is shared across all same-shape MoE layers (see get_dispatcher).
+        cap = int(max_num_tokens_per_gpu or x.shape[0])
+        dispatcher = get_dispatcher(
+            rank=ep_rank,
+            world_size=ep_size,
+            hidden_dim=x.shape[1],
+            num_local_experts=num_local,
+            num_experts_per_token=int(getattr(w, "top_k")),
+            max_num_inp_token_per_rank=cap,
+            data_type=torch.bfloat16,
+        )
 
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
