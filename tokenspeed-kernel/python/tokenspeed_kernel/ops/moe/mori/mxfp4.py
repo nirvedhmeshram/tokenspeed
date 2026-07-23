@@ -44,21 +44,23 @@ if platform.is_amd:
 
     def _grouped_mxfp4_gemm_3d(
         packed_x: torch.Tensor, counts: torch.Tensor, w: torch.nn.Module
-    ) -> torch.Tensor:
-        """Native MXFP4 grouped SwiGLU FFN over MORI's 3D [E,cap,H] padded buffer.
+    ) -> None:
+        """Native MXFP4 grouped SwiGLU FFN over MORI's 3D [E,cap,H] padded buffer, IN PLACE.
 
         Bridges MORI's padded 3D layout to the triton ragged (contiguous, expert-sorted)
         layout: gather valid rows (< counts[e]) into a flat buffer, run the mxfp4 grouped
-        GEMM on the raw packed weights (no dequant), scatter results back into a fresh 3D
-        buffer (padding rows = 0, ignored by MORI combine). Drop-in for the bf16
-        masked_grouped_gemm. Pure FFN — MORI combine applies the gate weights.
+        GEMM on the raw packed weights (no dequant), and scatter the results back into
+        ``packed_x`` itself. Padding rows (>= counts[e]) keep their stale dispatch values;
+        MORI combine reads only valid rows via src_info, so padding is ignored. Writing in
+        place avoids a full ``[E, cap*ws, H]`` zeros allocation + copy every MoE forward
+        (~10 GB at cap=2048) — the dominant cost at large cap. Pure FFN; combine applies
+        the gate weights.
         """
         E, cap, H = packed_x.shape
-        out = torch.zeros_like(packed_x)
         counts_long = counts.to(torch.long)
         total = int(counts_long.sum().item())
         if total == 0:
-            return out
+            return
         dev = packed_x.device
         offsets = torch.cumsum(counts_long, 0) - counts_long          # [E] start per expert
         expert_of_row = torch.repeat_interleave(
@@ -67,11 +69,11 @@ if platform.is_amd:
         local_of_row = torch.arange(total, device=dev) - offsets[expert_of_row]
         flat_idx = expert_of_row * cap + local_of_row                # [total] pos in [E*cap]
 
-        x_flat = packed_x.reshape(E * cap, H)[flat_idx]              # gather -> [total, H]
+        flat = packed_x.reshape(E * cap, H)
+        x_flat = flat[flat_idx]                                      # gather (copy) -> [total, H]
         meta = make_ragged_tensor_metadata(counts.to(torch.int32), total)
         y_flat = grouped_mxfp4_ffn(x_flat, meta, w).to(packed_x.dtype)   # [total, H]
-        out.reshape(E * cap, H)[flat_idx] = y_flat                   # scatter back
-        return out
+        flat[flat_idx] = y_flat                                      # scatter back IN PLACE
 
     @register_kernel(
         "moe",
@@ -139,7 +141,7 @@ if platform.is_amd:
 
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
-        packed.copy_(_grouped_mxfp4_gemm_3d(packed, handle["counts"], w))
+        _grouped_mxfp4_gemm_3d(packed, handle["counts"], w)  # in place
         out = dispatcher.combine(handle)
 
         # all_reduce comm-mode compensation. When attn.tp_size == moe.tp_ep_size (the
