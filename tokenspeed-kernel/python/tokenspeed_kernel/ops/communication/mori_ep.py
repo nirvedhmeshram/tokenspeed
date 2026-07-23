@@ -80,22 +80,20 @@ def masked_grouped_gemm(
     """Per-expert SwiGLU FFN over the first counts[e] rows of each expert slot; padding -> 0.
     Pure FFN (combine applies the top-k weighting). Returns packed_out [E_local, cap, hidden].
 
-    NOTE: naive per-expert loop for correctness. TODO(perf): replace with a Triton/gluon
-    masked grouped-GEMM (gluon stage1/stage2 already do per-expert padded grouped GEMM +
-    counts — the same layout as ``packed_x`` — so this is a re-plumbing, not a new algorithm).
+    Vectorized: 2 batched GEMMs over all experts at once (padding rows masked to 0 so
+    combine, which reads only valid rows via src_info, is unaffected). Avoids the
+    per-expert Python loop (was ~96 x nlayers x 2 tiny matmuls/forward -> the main perf
+    killer). A native mxfp4 grouped-GEMM (only valid rows) is the further perf follow-on.
     """
     E, cap, H = packed_x.shape
     I = w13.shape[1] // 2
-    out = torch.zeros_like(packed_x)
-    for e in range(E):
-        n = int(counts[e].item())
-        if n == 0:
-            continue
-        h = packed_x[e, :n].float()                              # [n, H]
-        gate_up = h @ w13[e].float().t()                        # [n, 2I]
-        inter = torch.nn.functional.silu(gate_up[:, :I]) * gate_up[:, I:]   # [n, I]
-        out[e, :n] = (inter @ w2[e].float().t()).to(packed_x.dtype)
-    return out
+    # zero padding rows (>= counts[e]) so padding never produces NaN/garbage that could leak
+    valid = (torch.arange(cap, device=packed_x.device)[None, :] < counts[:, None].to(torch.long))
+    xin = (packed_x * valid[..., None]).to(torch.bfloat16)             # [E, cap, H]
+    gate_up = torch.bmm(xin, w13.transpose(1, 2))                       # [E, cap, 2I]
+    inter = torch.nn.functional.silu(gate_up[..., :I]) * gate_up[..., I:]   # [E, cap, I]
+    out = torch.bmm(inter.to(torch.bfloat16), w2.transpose(1, 2))       # [E, cap, H]
+    return (out * valid[..., None]).to(packed_x.dtype)
 
 
 # MXFP4 (E2M1) code -> value lookup; 2 codes packed per uint8 (low nibble first).
