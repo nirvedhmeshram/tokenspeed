@@ -73,6 +73,13 @@ class All2AllBackend(Enum):
     def is_mori(self):
         return self == All2AllBackend.MORI
 
+    def is_all_to_all(self):
+        """True for backends that perform a real dispatch/combine all-to-all inside the
+        MoE kernel (as opposed to the masked-replicate ``none`` fallback). Such backends
+        return the COMPLETE per-token result and must run through the model's all-to-all
+        MoE forward (local/dp-sharded tokens, no framework MoE collective)."""
+        return self in (All2AllBackend.DEEPEP, All2AllBackend.MORI)
+
 
 class MoeBackend(Enum):
 
