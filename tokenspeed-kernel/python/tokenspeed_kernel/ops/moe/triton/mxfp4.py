@@ -214,6 +214,68 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     return quant_tensor, InFlexData(), scale
 
 
+def grouped_mxfp4_ffn(
+    x_flat: torch.Tensor,
+    ragged_metadata: RaggedTensorMetadata,
+    w: torch.nn.Module,
+) -> torch.Tensor:
+    """Pure grouped MXFP4 SwiGLU FFN over expert-sorted CONTIGUOUS rows.
+
+    ``x_flat`` [total, H] bf16/fp16, rows already grouped by expert with per-expert
+    group sizes described by ``ragged_metadata`` (built via
+    ``make_ragged_tensor_metadata(counts, total)``). No routing, no gather/scatter,
+    no gate-weighting — the FFN only. For all-to-all EP backends (e.g. MORI) that do
+    their own dispatch/combine and apply the gate weights in combine.
+
+    Reuses the exact mxfp4 weights (``w13_weight_triton_tensor`` / precision_config
+    produced by :func:`triton_mxfp4_moe_weights`) and activation handling as
+    :func:`triton_mxfp4_moe_apply` — NO dequant. Returns [total, H].
+    """
+    w13_weight = w.w13_weight_triton_tensor
+    w2_weight = w.w2_weight_triton_tensor
+    w13_bias = getattr(w, "w13_weight_bias", None)
+    w2_bias = getattr(w, "w2_weight_bias", None)
+    w13_pc = getattr(w, "w13_precision_config", None)
+    w2_pc = getattr(w, "w2_precision_config", None)
+
+    use_dynamic_mxfp4 = _uses_dynamic_mxfp4_activations(w)
+    if hasattr(w, "w13_act_scale"):
+        gemm1_input = fp8_quantize(x_flat, scale=w.w13_act_scale)
+    elif use_dynamic_mxfp4:
+        gemm1_input, gemm1_scale = _quantize_mxfp4_activation(x_flat)
+        w13_pc = _with_activation_mx_scale(w13_pc, gemm1_scale)
+    else:
+        gemm1_input = x_flat
+
+    with _maybe_lds_guard(gemm1_input, w13_weight, w13_pc):
+        gate_up = matmul(
+            gemm1_input,
+            w13_weight,
+            w13_bias,
+            a_ragged_metadata=ragged_metadata,
+            precision_config=w13_pc,
+        )
+    inter = _silu_gate_up(gate_up, output_dtype=x_flat.dtype)
+
+    if hasattr(w, "w2_act_scale"):
+        gemm2_input = fp8_quantize(inter, scale=w.w2_act_scale)
+    elif use_dynamic_mxfp4:
+        gemm2_input, gemm2_scale = _quantize_mxfp4_activation(inter)
+        w2_pc = _with_activation_mx_scale(w2_pc, gemm2_scale)
+    else:
+        gemm2_input = inter
+
+    with _maybe_lds_guard(gemm2_input, w2_weight, w2_pc):
+        out = matmul(
+            gemm2_input,
+            w2_weight,
+            w2_bias,
+            a_ragged_metadata=ragged_metadata,
+            precision_config=w2_pc,
+        )
+    return out
+
+
 def _routing_from_topk(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,

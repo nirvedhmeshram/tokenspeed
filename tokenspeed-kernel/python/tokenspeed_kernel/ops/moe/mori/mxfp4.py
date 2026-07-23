@@ -3,11 +3,16 @@
 # SPDX-License-Identifier: MIT
 """Registered MXFP4 MoE apply using MORI all-to-all EP.
 
-Correctness-first v1: dispatch bf16 hidden states via MORI, dequantize the MXFP4
-expert weights to bf16 (cached on the module), run the bf16 masked grouped-GEMM,
-and combine. This reuses the validated bf16 path; a native MXFP4 grouped-GEMM (no
-dequant) is the perf follow-on. Selected for Kimi-K2.5-MXFP4 with
+Native MXFP4 path (NO dequant): weights are swizzled once at load via the shared
+``triton_mxfp4_moe_weights`` preprocessor; each forward MORI dispatches bf16 hidden
+states, the tokens (already grouped per local expert in MORI's 3D [E,cap,H] buffer)
+are gathered into a contiguous expert-sorted buffer and run through the triton mxfp4
+grouped-GEMM (``grouped_mxfp4_ffn``) directly on the packed MXFP4 weights, scattered
+back into the 3D buffer, and combined. Selected for Kimi-K2.5-MXFP4 with
 --enable-expert-parallel --all2all-backend mori.
+
+Replaces the earlier correctness-first v1 that dequantized weights to bf16 every
+forward (~4 s/token + transient memory pressure); the native GEMM eliminates both.
 """
 from __future__ import annotations
 
@@ -26,29 +31,54 @@ platform = current_platform()
 
 
 if platform.is_amd:
-    from tokenspeed_kernel.ops.communication.mori_ep import (
-        dequant_mxfp4,
-        get_dispatcher,
-        masked_grouped_gemm,
+    from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
+
+    with redirect_triton_to_tokenspeed_triton():
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+
+    from tokenspeed_kernel.ops.communication.mori_ep import get_dispatcher
+    from tokenspeed_kernel.ops.moe.triton.mxfp4 import (
+        grouped_mxfp4_ffn,
+        triton_mxfp4_moe_weights,
     )
 
-    def _dequant_experts_bf16(w: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dequantize the local experts' MXFP4 weights to bf16 (TRANSIENT — NOT cached).
+    def _grouped_mxfp4_gemm_3d(
+        packed_x: torch.Tensor, counts: torch.Tensor, w: torch.nn.Module
+    ) -> torch.Tensor:
+        """Native MXFP4 grouped SwiGLU FFN over MORI's 3D [E,cap,H] padded buffer.
 
-        Caching per layer would accumulate ~8GB x num_layers of bf16 experts on top of the
-        MXFP4 weights (OOM on a full model). Transient dequant keeps only the current layer's
-        bf16 live (freed after this layer's GEMM). Slow (re-dequants each forward) but memory-
-        feasible; the perf fix is a native MXFP4 grouped-GEMM (no dequant).
-        w13_weight [E,2I,H//2] uint8 + w13_weight_scale [E,2I,H//32] -> bf16 [E,2I,H]; likewise w2."""
-        w13 = dequant_mxfp4(w.w13_weight, w.w13_weight_scale)   # [E, 2I, H]
-        w2 = dequant_mxfp4(w.w2_weight, w.w2_weight_scale)      # [E, H, I]
-        return w13, w2
+        Bridges MORI's padded 3D layout to the triton ragged (contiguous, expert-sorted)
+        layout: gather valid rows (< counts[e]) into a flat buffer, run the mxfp4 grouped
+        GEMM on the raw packed weights (no dequant), scatter results back into a fresh 3D
+        buffer (padding rows = 0, ignored by MORI combine). Drop-in for the bf16
+        masked_grouped_gemm. Pure FFN — MORI combine applies the gate weights.
+        """
+        E, cap, H = packed_x.shape
+        out = torch.zeros_like(packed_x)
+        counts_long = counts.to(torch.long)
+        total = int(counts_long.sum().item())
+        if total == 0:
+            return out
+        dev = packed_x.device
+        offsets = torch.cumsum(counts_long, 0) - counts_long          # [E] start per expert
+        expert_of_row = torch.repeat_interleave(
+            torch.arange(E, device=dev), counts_long
+        )                                                             # [total]
+        local_of_row = torch.arange(total, device=dev) - offsets[expert_of_row]
+        flat_idx = expert_of_row * cap + local_of_row                # [total] pos in [E*cap]
+
+        x_flat = packed_x.reshape(E * cap, H)[flat_idx]              # gather -> [total, H]
+        meta = make_ragged_tensor_metadata(counts.to(torch.int32), total)
+        y_flat = grouped_mxfp4_ffn(x_flat, meta, w).to(packed_x.dtype)   # [total, H]
+        out.reshape(E * cap, H)[flat_idx] = y_flat                   # scatter back
+        return out
 
     @register_kernel(
         "moe",
         "apply",
         name="mori_ep_mxfp4_moe_apply",
         solution="mori",
+        weight_preprocessor=triton_mxfp4_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),
             min_arch_version=ArchVersion(9, 5),
@@ -63,8 +93,8 @@ if platform.is_amd:
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({True}),
             "ispp_alignment": frozenset({1}),
-            "internal_activation_dtype": frozenset({"input"}),
-            "supports_bias": frozenset({False}),
+            "internal_activation_dtype": frozenset({"input", "fp8"}),
+            "supports_bias": frozenset({True}),
         },
         priority=Priority.SPECIALIZED + 2,
     )
@@ -87,16 +117,15 @@ if platform.is_amd:
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        w13_bf16, w2_bf16 = _dequant_experts_bf16(w)
-
         ep_size = int(getattr(w, "ep_size", dist.get_world_size()))
         ep_rank = int(getattr(w, "ep_rank", dist.get_rank()))
-        num_local = int(getattr(w, "num_local_experts", w13_bf16.shape[0]))
+        num_local = int(getattr(w, "num_local_experts"))
         # Fixed MORI dispatch capacity (tokens/rank). MORI allocates symmetric buffers
         # ~[num_local, ws*cap, H] at op-creation, so cap must upper-bound tokens/rank but
         # stay memory-bounded. Env override for larger prefill. (Prefill-mode dispatch is
         # a deferred follow-on; this targets decode / short prompts.)
         import os as _os
+
         cap = int(_os.environ.get("MORI_EP_MAX_TOKENS_PER_RANK", "2048"))
         dispatcher = get_dispatcher(
             rank=ep_rank,
@@ -110,5 +139,5 @@ if platform.is_amd:
 
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
-        packed.copy_(masked_grouped_gemm(packed, handle["counts"], w13_bf16, w2_bf16))
+        packed.copy_(_grouped_mxfp4_gemm_3d(packed, handle["counts"], w))
         return dispatcher.combine(handle)
