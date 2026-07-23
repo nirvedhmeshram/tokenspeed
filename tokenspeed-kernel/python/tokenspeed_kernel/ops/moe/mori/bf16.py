@@ -100,4 +100,11 @@ if platform.is_amd:
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
         packed.copy_(masked_grouped_gemm(packed, handle["counts"], w.w13_weight, w.w2_weight))
-        return dispatcher.combine(handle)
+        out = dispatcher.combine(handle)
+        # See mori/mxfp4.py: in all_reduce comm mode (attn.tp == moe.tp_ep, dp=1 full EP)
+        # the framework all_reduces the MoE output over the tp_ep group, expecting a
+        # partial. MORI already returns the complete result on every rank, so pre-divide
+        # by ep_size to let all_reduce reconstruct it.
+        if ep_size > 1:
+            out = out / ep_size
+        return out

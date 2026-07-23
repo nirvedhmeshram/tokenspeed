@@ -140,4 +140,17 @@ if platform.is_amd:
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
         packed.copy_(_grouped_mxfp4_gemm_3d(packed, handle["counts"], w))
-        return dispatcher.combine(handle)
+        out = dispatcher.combine(handle)
+
+        # all_reduce comm-mode compensation. When attn.tp_size == moe.tp_ep_size (the
+        # dp=1 full-EP case), CommManager.post_moe_comm all_reduces the MoE output over
+        # the tp_ep group, expecting each rank to return a PARTIAL (local-experts-only)
+        # result — the masked-replicate contract. MORI's all-to-all already returns the
+        # COMPLETE routed result on every rank (input is replicated in this mode), so the
+        # framework's SUM would over-count it by ep_size. Pre-divide so all_reduce
+        # reconstructs the complete result (sum of ep_size copies of out/ep_size == out).
+        # In RSAG mode (dp>1) post_moe reduce-scatters sharded tokens instead; that path
+        # is a separate follow-on and is not compensated here.
+        if ep_size > 1:
+            out = out / ep_size
+        return out
