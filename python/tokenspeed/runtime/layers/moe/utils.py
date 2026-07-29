@@ -49,7 +49,7 @@ class All2AllBackend(Enum):
     FLASHINFER_NVLINK_ONE_SIDED = "flashinfer_nvlink_one_sided"
     # AMD-native EP dispatch/combine via MORI (github.com/ROCm/mori). IntraNode
     # (XGMI) + InterNode (RDMA) kernels; real all-to-all, unlike the masked-replicate
-    # `none` fallback. See mori-ep integration.
+    # `none` fallback.
     MORI = "mori"
 
     @classmethod

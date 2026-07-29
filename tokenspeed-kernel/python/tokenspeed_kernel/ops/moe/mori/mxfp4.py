@@ -142,8 +142,7 @@ if platform.is_amd:
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
         _grouped_mxfp4_gemm_3d(packed, handle["counts"], w)  # in place
-        # Return the COMPLETE per-token routed result. The model decides how it is
-        # consumed: DeepseekV3MoE.forward pre-divides by tp_ep_size in dp=1 all_reduce
-        # mode (framework all_reduces), while forward_alltoall (dp>1 DP-attention) uses it
-        # directly with no framework MoE reduce. Do NOT compensate here.
+        # Return the COMPLETE per-token routed result. The model consumes it via
+        # forward_alltoall, which uses it directly with no framework MoE reduce for the
+        # routed path (both dp=1 and dp>1). Do NOT reduce/scale here.
         return dispatcher.combine(handle)

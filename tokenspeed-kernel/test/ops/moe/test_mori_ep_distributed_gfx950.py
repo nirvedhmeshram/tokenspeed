@@ -55,8 +55,8 @@ if not _is_gfx950():
 
 import torch.distributed as dist  # noqa: E402
 import tokenspeed_kernel  # noqa: E402
+from kimi3_reference import dequantize_mxfp4  # noqa: E402
 from tokenspeed_kernel.ops.communication.mori_ep import (  # noqa: E402
-    dequant_mxfp4,
     get_dispatcher,
     masked_grouped_gemm,
     mori_available,
@@ -113,8 +113,8 @@ def _run(quant: str) -> None:
         w2_p = torch.stack([q(w2[e])[0] for e in range(e_total)])
         w2_s = torch.stack([q(w2[e])[1] for e in range(e_total)])
         # reference uses the *dequantized* weights (what the kernel effectively multiplies)
-        ref_w13 = dequant_mxfp4(w13_p, w13_s)
-        ref_w2 = dequant_mxfp4(w2_p, w2_s)
+        ref_w13 = dequantize_mxfp4(w13_p, w13_s)
+        ref_w2 = dequantize_mxfp4(w2_p, w2_s)
         wmod = torch.nn.Module()
         wmod.w13_weight, wmod.w13_weight_scale = w13_p[lo:hi].contiguous(), w13_s[lo:hi].contiguous()
         wmod.w2_weight, wmod.w2_weight_scale = w2_p[lo:hi].contiguous(), w2_s[lo:hi].contiguous()

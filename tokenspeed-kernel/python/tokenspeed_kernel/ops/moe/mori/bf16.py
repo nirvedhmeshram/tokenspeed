@@ -100,7 +100,7 @@ if platform.is_amd:
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
         packed.copy_(masked_grouped_gemm(packed, handle["counts"], w.w13_weight, w.w2_weight))
-        # Return the COMPLETE per-token routed result; the model compensates for the
-        # framework all_reduce in dp=1 mode (DeepseekV3MoE.forward) and bypasses it in
-        # dp>1 DP-attention (forward_alltoall). See mori/mxfp4.py. Do NOT compensate here.
+        # Return the COMPLETE per-token routed result. The model consumes it via
+        # forward_alltoall, which uses it directly with no framework MoE reduce for the
+        # routed path (both dp=1 and dp>1). Do NOT reduce/scale here.
         return dispatcher.combine(handle)

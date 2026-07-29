@@ -387,20 +387,6 @@ class DeepseekV3MoE(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
         else:
-            # all_reduce comm-mode compensation for real all-to-all backends. When
-            # attn.tp_size == moe.tp_ep_size (dp=1 full-EP) the decoder's post_moe_comm
-            # all_reduces the MoE output over the tp_ep group, expecting a PARTIAL
-            # (masked-replicate) result. MORI/DeepEP return the COMPLETE routed result on
-            # every rank, so pre-divide by tp_ep_size and let all_reduce reconstruct it.
-            # The shared expert is tp_ep-sharded (partial) and is completed by the same
-            # all_reduce, so it is NOT divided. (dp>1 uses forward_alltoall instead, which
-            # has no framework MoE reduce.)
-            if (
-                get_all2all_backend().is_all_to_all()
-                and self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size
-                and self.mapping.moe.tp_ep_size > 1
-            ):
-                routed_expert_output = routed_expert_output / self.mapping.moe.tp_ep_size
             final_hidden_states = (
                 routed_expert_output + shared_output
                 if shared_output is not None
@@ -416,10 +402,17 @@ class DeepseekV3MoE(nn.Module):
         comm_manager,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """All-to-all EP forward for DP-attention (attn dp>1, moe ep>1).
+        """All-to-all EP forward for real dispatch/combine backends (e.g. MORI).
 
-        Tokens are DP-sharded (distinct per rank). Routing + routed experts run on the
-        LOCAL shard; the MORI/DeepEP kernel does dispatch -> expert GEMM -> combine
+        Used in both comm modes: dp>1 DP-attention (RSAG) and dp=1 full-EP (all_reduce).
+        The routed experts return the COMPLETE result from the backend's combine (no
+        framework MoE reduce); only the tp_ep-sharded shared expert is reduced, via
+        pre/post_moe_comm which adapt to the comm mode (all-gather + reduce-scatter under
+        RSAG; no-op + all_reduce under dp=1).
+
+        Tokens are local per rank (distinct dp shards when dp>1; the full replicated
+        batch when dp=1). Routing + routed experts run on the LOCAL tokens; the
+        MORI/DeepEP kernel does dispatch -> expert GEMM -> combine
         internally and returns the COMPLETE per-local-token result, so NO framework MoE
         collective is used for the routed path (unlike the masked-replicate ``none`` path).
 
@@ -1456,16 +1449,13 @@ class DeepseekV3DecoderLayer(nn.Module):
         num_global_tokens,
         max_num_tokens_per_gpu,
     ):
-        # All-to-all EP path (real dispatch/combine backend + DP-attention / RSAG mode):
-        # the MoE keeps tokens LOCAL (dp-sharded) and does its own dispatch/combine, so we
-        # bypass the framework's pre/post-MoE all-gather + reduce-scatter entirely. Only
-        # taken when the framework would otherwise reduce-scatter (not the dp=1 all_reduce
-        # case, which the standard path handles with the /tp_ep_size compensation).
-        if (
-            self.is_moe_layer
-            and get_all2all_backend().is_all_to_all()
-            and not self.comm_manager.use_all_reduce(is_moe=True)
-        ):
+        # All-to-all EP path (real dispatch/combine backend, e.g. MORI): the MoE keeps
+        # tokens LOCAL and does its own dispatch/combine, returning the COMPLETE routed
+        # result, so we bypass the framework's pre/post-MoE collectives for the routed
+        # path. Used in both comm modes -- dp>1 (RSAG) and dp=1 full-EP (all_reduce):
+        # forward_alltoall reduces only the shared expert (via pre/post_moe_comm, which
+        # adapt to the mode) and leaves the routed output untouched.
+        if self.is_moe_layer and get_all2all_backend().is_all_to_all():
             return self.mlp.forward_alltoall(
                 hidden_states,
                 num_global_tokens,

@@ -3,19 +3,14 @@
 # SPDX-License-Identifier: MIT
 """AMD-native EP dispatch/combine backed by MORI (github.com/ROCm/mori).
 
-Uses MORI's v2 op API (``mori.ops.dispatch_combine_v2``) — the maintained
-standard-MoE (DeepEP-style) path. The v1 ``dispatch_standard_moe``/convert path
-is broken in current builds; basic v1 dispatch/combine works but only for the 2D
-(ungrouped) case. v2 gives the grouped ``[num_local_experts, cap, hidden]`` layout
-that a masked grouped-GEMM consumes.
+Uses MORI's v2 op API (``mori.ops.dispatch_combine_v2``), which yields the grouped
+``[num_local_experts, cap, hidden]`` layout that a masked grouped-GEMM consumes.
 
 Validated end-to-end on gfx950 (dispatch -> convert_dispatch_output -> masked
 grouped-GEMM -> convert_combine_input -> combine) vs a reference MoE: cos=1.0.
 
-Requires: `pip install -e ~/mori` (ENABLE_STANDARD_MOE_ADAPT=ON), `pip install flydsl`,
-and `ROCM_PATH` -> a hipcc that supports `--genco` (see the rocm-local overlay).
-
-Selected when ``--all2all-backend mori`` (``All2AllBackend.MORI``) + expert parallel.
+Requires the ``mori`` and ``flydsl`` packages. Selected when ``--all2all-backend mori``
+(``All2AllBackend.MORI``) + expert parallel.
 """
 from __future__ import annotations
 
@@ -80,10 +75,8 @@ def masked_grouped_gemm(
     """Per-expert SwiGLU FFN over the first counts[e] rows of each expert slot; padding -> 0.
     Pure FFN (combine applies the top-k weighting). Returns packed_out [E_local, cap, hidden].
 
-    Vectorized: 2 batched GEMMs over all experts at once (padding rows masked to 0 so
-    combine, which reads only valid rows via src_info, is unaffected). Avoids the
-    per-expert Python loop (was ~96 x nlayers x 2 tiny matmuls/forward -> the main perf
-    killer). A native mxfp4 grouped-GEMM (only valid rows) is the further perf follow-on.
+    Two batched GEMMs over all experts at once, with padding rows (>= counts[e]) masked to
+    0 so MORI combine -- which reads only valid rows via src_info -- is unaffected.
     """
     E, cap, H = packed_x.shape
     I = w13.shape[1] // 2
@@ -94,45 +87,6 @@ def masked_grouped_gemm(
     inter = torch.nn.functional.silu(gate_up[..., :I]) * gate_up[..., I:]   # [E, cap, I]
     out = torch.bmm(inter.to(torch.bfloat16), w2.transpose(1, 2))       # [E, cap, H]
     return (out * valid[..., None]).to(packed_x.dtype)
-
-
-# MXFP4 (E2M1) code -> value lookup; 2 codes packed per uint8 (low nibble first).
-_E2M1_LUT = None
-
-
-def dequant_mxfp4(packed: torch.Tensor, scale_e8m0: torch.Tensor, group_size: int = 32) -> torch.Tensor:
-    """Dequantize MXFP4 weights to bf16. packed [..., K//2] uint8 (2 fp4/byte, lo=first),
-    scale_e8m0 [..., K//group_size] uint8 (biased +127) -> bf16 [..., K].
-
-    Validated round-trip (bf16->mxfp4->bf16) cos~0.99. Used to reuse the bf16 grouped-GEMM
-    for the MORI MXFP4 path (correctness-first; a native mxfp4 grouped-GEMM is the perf follow-on).
-    """
-    global _E2M1_LUT
-    if _E2M1_LUT is None or _E2M1_LUT.device != packed.device:
-        _E2M1_LUT = torch.tensor(
-            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
-            device=packed.device, dtype=torch.bfloat16,
-        )
-
-    def _one(p2d: torch.Tensor, s2d: torch.Tensor) -> torch.Tensor:
-        # p2d [R, K//2] uint8, s2d [R, K//32] uint8 -> [R, K] bf16
-        lo = (p2d & 0xF).to(torch.int32)
-        hi = ((p2d >> 4) & 0xF).to(torch.int32)
-        codes = torch.stack([lo, hi], dim=-1).reshape(p2d.shape[0], -1)   # [R, K] int32
-        vals = _E2M1_LUT[codes]                                           # [R, K] bf16
-        sc = torch.exp2(s2d.to(torch.bfloat16) - 127).repeat_interleave(group_size, dim=-1)
-        return vals * sc[:, : vals.shape[-1]]
-
-    if packed.dim() == 2:
-        return _one(packed, scale_e8m0)
-    # [E, R, K//2] -> loop experts to bound transient memory (avoid a full [E,R,K] int64 blowup)
-    E = packed.shape[0]
-    out = torch.empty(
-        (E, packed.shape[1], packed.shape[2] * 2), dtype=torch.bfloat16, device=packed.device
-    )
-    for e in range(E):
-        out[e] = _one(packed[e], scale_e8m0[e])
-    return out
 
 
 class MoriEpDispatcher:
@@ -178,7 +132,7 @@ class MoriEpDispatcher:
         topk_ids: torch.Tensor,        # [num_tokens, topk] (global expert ids)
         scales: torch.Tensor | None = None,
     ) -> dict[str, Any]:
-        recv_x, _ow, _os, _oi, total_recv, routing = self._op.dispatch(
+        recv_x, _ow, _os, _oi, _total_recv, routing = self._op.dispatch(
             hidden_states, topk_weights, scales, topk_ids.to(torch.int32), return_routing=True
         )
         packed_x, counts, packed_src = self._op.convert_dispatch_output()
@@ -187,7 +141,6 @@ class MoriEpDispatcher:
             "packed_x": packed_x,      # [E_local, cap, hidden]; write expert output here in place
             "counts": counts,          # [E_local] per-expert valid-row counts
             "routing": routing,
-            "total_recv": int(total_recv.cpu().item()),
         }
 
     def combine(self, handle: dict[str, Any]) -> torch.Tensor:

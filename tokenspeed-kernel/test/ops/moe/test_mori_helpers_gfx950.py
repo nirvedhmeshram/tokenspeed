@@ -44,8 +44,8 @@ if not _is_gfx950():
     )
 
 import tokenspeed_kernel  # noqa: E402
+from kimi3_reference import dequantize_mxfp4  # noqa: E402
 from tokenspeed_kernel.ops.communication.mori_ep import (  # noqa: E402
-    dequant_mxfp4,
     masked_grouped_gemm,
 )
 from tokenspeed_kernel.ops.moe.mori.mxfp4 import _grouped_mxfp4_gemm_3d  # noqa: E402
@@ -91,16 +91,6 @@ def _swizzled_weight_module(w13_p, w13_s, w2_p, w2_s, top_k=8):
     return w
 
 
-def test_dequant_mxfp4_roundtrip() -> None:
-    dev = torch.device("cuda", 0)
-    gen = torch.Generator(device=dev).manual_seed(0)
-    ref = torch.randn(256, 512, generator=gen, device=dev, dtype=torch.bfloat16) * 0.05
-    packed, scale = _quant_mxfp4(ref)
-    got = dequant_mxfp4(packed, scale)
-    assert got.shape == ref.shape
-    assert _cos(got, ref) > 0.98
-
-
 def test_masked_grouped_gemm_matches_per_expert_loop() -> None:
     dev = torch.device("cuda", 0)
     gen = torch.Generator(device=dev).manual_seed(7)
@@ -137,8 +127,8 @@ def test_grouped_mxfp4_ffn_matches_dequant_reference() -> None:
     total = int(counts.sum().item())
 
     w13_p, w13_s, w2_p, w2_s = _make_mxfp4_expert_weights(E, H, I, dev, gen)
-    w13_dq = dequant_mxfp4(w13_p, w13_s).float()
-    w2_dq = dequant_mxfp4(w2_p, w2_s).float()
+    w13_dq = dequantize_mxfp4(w13_p, w13_s).float()
+    w2_dq = dequantize_mxfp4(w2_p, w2_s).float()
     w = _swizzled_weight_module(w13_p, w13_s, w2_p, w2_s)
 
     x_flat = torch.randn(total, H, generator=gen, device=dev, dtype=torch.bfloat16) * 0.1
@@ -173,8 +163,8 @@ def test_grouped_mxfp4_gemm_3d_bridge() -> None:
     counts = torch.tensor(counts_list, device=dev, dtype=torch.int32)
 
     w13_p, w13_s, w2_p, w2_s = _make_mxfp4_expert_weights(E, H, I, dev, gen)
-    w13_dq = dequant_mxfp4(w13_p, w13_s).float()
-    w2_dq = dequant_mxfp4(w2_p, w2_s).float()
+    w13_dq = dequantize_mxfp4(w13_p, w13_s).float()
+    w2_dq = dequantize_mxfp4(w2_p, w2_s).float()
     w = _swizzled_weight_module(w13_p, w13_s, w2_p, w2_s)
 
     # padding rows deliberately non-zero — must be left untouched by the gather/scatter
