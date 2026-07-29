@@ -1,0 +1,241 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# SPDX-License-Identifier: MIT
+"""AMD-native EP dispatch/combine backed by MORI (github.com/ROCm/mori).
+
+Uses MORI's v2 op API (``mori.ops.dispatch_combine_v2``) — the maintained
+standard-MoE (DeepEP-style) path. The v1 ``dispatch_standard_moe``/convert path
+is broken in current builds; basic v1 dispatch/combine works but only for the 2D
+(ungrouped) case. v2 gives the grouped ``[num_local_experts, cap, hidden]`` layout
+that a masked grouped-GEMM consumes.
+
+Validated end-to-end on gfx950 (dispatch -> convert_dispatch_output -> masked
+grouped-GEMM -> convert_combine_input -> combine) vs a reference MoE: cos=1.0.
+
+Requires: `pip install -e ~/mori` (ENABLE_STANDARD_MOE_ADAPT=ON), `pip install flydsl`,
+and `ROCM_PATH` -> a hipcc that supports `--genco` (see the rocm-local overlay).
+
+Selected when ``--all2all-backend mori`` (``All2AllBackend.MORI``) + expert parallel.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+import torch
+import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
+
+_MORI_AVAILABLE = None
+_COMM = None  # process-wide mori.cco.Communicator singleton
+
+
+def mori_available() -> bool:
+    """True if MORI v2 EP ops (and flydsl) can be imported."""
+    global _MORI_AVAILABLE
+    if _MORI_AVAILABLE is None:
+        try:
+            import flydsl  # noqa: F401
+            from mori.cco import Communicator  # noqa: F401
+            from mori.ops.dispatch_combine_v2 import (  # noqa: F401
+                EpDispatchCombineConfig,
+                EpDispatchCombineOp,
+            )
+
+            _MORI_AVAILABLE = True
+        except Exception as e:  # pragma: no cover
+            logger.warning("MORI v2 EP not available: %s", e)
+            _MORI_AVAILABLE = False
+    return _MORI_AVAILABLE
+
+
+def ensure_mori_comm(per_rank_vmm: int | None = None):
+    """Create the process-wide MORI CCO Communicator once (uid broadcast over the
+    world group). torch.distributed must already be initialized. Returns the comm."""
+    global _COMM
+    if _COMM is not None:
+        return _COMM
+    from mori.cco import Communicator
+
+    assert dist.is_initialized(), "torch.distributed must be initialized before MORI comm init"
+    rank = dist.get_rank()
+    uid = Communicator.get_unique_id() if rank == 0 else None
+    objs = [uid]
+    dist.broadcast_object_list(objs, src=0)
+    uid = objs[0]
+    if per_rank_vmm is None:
+        per_rank_vmm = int(os.environ.get("MORI_PER_RANK_VMM", str(4 << 30)))  # 4 GiB default
+    _COMM = Communicator.init(dist.get_world_size(), rank, uid, per_rank_vmm=per_rank_vmm)
+    return _COMM
+
+
+def masked_grouped_gemm(
+    packed_x: torch.Tensor,   # [E_local, cap, hidden]  (dispatched tokens grouped by local expert)
+    counts: torch.Tensor,     # [E_local] int32         (valid rows per expert)
+    w13: torch.Tensor,        # [E_local, 2*I, hidden]  gate rows [0:I], up [I:2I]
+    w2: torch.Tensor,         # [E_local, hidden, I]
+) -> torch.Tensor:
+    """Per-expert SwiGLU FFN over the first counts[e] rows of each expert slot; padding -> 0.
+    Pure FFN (combine applies the top-k weighting). Returns packed_out [E_local, cap, hidden].
+
+    Vectorized: 2 batched GEMMs over all experts at once (padding rows masked to 0 so
+    combine, which reads only valid rows via src_info, is unaffected). Avoids the
+    per-expert Python loop (was ~96 x nlayers x 2 tiny matmuls/forward -> the main perf
+    killer). A native mxfp4 grouped-GEMM (only valid rows) is the further perf follow-on.
+    """
+    E, cap, H = packed_x.shape
+    I = w13.shape[1] // 2
+    # zero padding rows (>= counts[e]) so padding never produces NaN/garbage that could leak
+    valid = (torch.arange(cap, device=packed_x.device)[None, :] < counts[:, None].to(torch.long))
+    xin = (packed_x * valid[..., None]).to(torch.bfloat16)             # [E, cap, H]
+    gate_up = torch.bmm(xin, w13.transpose(1, 2))                       # [E, cap, 2I]
+    inter = torch.nn.functional.silu(gate_up[..., :I]) * gate_up[..., I:]   # [E, cap, I]
+    out = torch.bmm(inter.to(torch.bfloat16), w2.transpose(1, 2))       # [E, cap, H]
+    return (out * valid[..., None]).to(packed_x.dtype)
+
+
+# MXFP4 (E2M1) code -> value lookup; 2 codes packed per uint8 (low nibble first).
+_E2M1_LUT = None
+
+
+def dequant_mxfp4(packed: torch.Tensor, scale_e8m0: torch.Tensor, group_size: int = 32) -> torch.Tensor:
+    """Dequantize MXFP4 weights to bf16. packed [..., K//2] uint8 (2 fp4/byte, lo=first),
+    scale_e8m0 [..., K//group_size] uint8 (biased +127) -> bf16 [..., K].
+
+    Validated round-trip (bf16->mxfp4->bf16) cos~0.99. Used to reuse the bf16 grouped-GEMM
+    for the MORI MXFP4 path (correctness-first; a native mxfp4 grouped-GEMM is the perf follow-on).
+    """
+    global _E2M1_LUT
+    if _E2M1_LUT is None or _E2M1_LUT.device != packed.device:
+        _E2M1_LUT = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+            device=packed.device, dtype=torch.bfloat16,
+        )
+
+    def _one(p2d: torch.Tensor, s2d: torch.Tensor) -> torch.Tensor:
+        # p2d [R, K//2] uint8, s2d [R, K//32] uint8 -> [R, K] bf16
+        lo = (p2d & 0xF).to(torch.int32)
+        hi = ((p2d >> 4) & 0xF).to(torch.int32)
+        codes = torch.stack([lo, hi], dim=-1).reshape(p2d.shape[0], -1)   # [R, K] int32
+        vals = _E2M1_LUT[codes]                                           # [R, K] bf16
+        sc = torch.exp2(s2d.to(torch.bfloat16) - 127).repeat_interleave(group_size, dim=-1)
+        return vals * sc[:, : vals.shape[-1]]
+
+    if packed.dim() == 2:
+        return _one(packed, scale_e8m0)
+    # [E, R, K//2] -> loop experts to bound transient memory (avoid a full [E,R,K] int64 blowup)
+    E = packed.shape[0]
+    out = torch.empty(
+        (E, packed.shape[1], packed.shape[2] * 2), dtype=torch.bfloat16, device=packed.device
+    )
+    for e in range(E):
+        out[e] = _one(packed[e], scale_e8m0[e])
+    return out
+
+
+class MoriEpDispatcher:
+    """MORI v2 dispatch/combine for one MoE layer-group shape.
+
+    Usage (mirrors the registered kernel):
+        h = disp.dispatch(hidden, topk_weights, topk_ids)
+        packed = h["packed_x"]                                   # [E_local, cap, H]
+        packed.copy_(masked_grouped_gemm(packed, h["counts"], w13, w2))   # GEMM in place
+        out = disp.combine(h)                                    # [num_tokens, H]
+    """
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        hidden_dim: int,
+        num_local_experts: int,
+        num_experts_per_token: int,
+        max_num_inp_token_per_rank: int,
+        data_type: torch.dtype = torch.bfloat16,
+    ) -> None:
+        assert mori_available(), "MORI v2 EP not importable"
+        from mori.ops.dispatch_combine_v2 import EpDispatchCombineConfig, EpDispatchCombineOp
+
+        comm = ensure_mori_comm()
+        self._cfg = EpDispatchCombineConfig(
+            rank=rank,
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            num_experts_per_rank=num_local_experts,
+            num_experts_per_token=num_experts_per_token,
+            data_type=data_type,
+            enable_std_moe=True,
+        )
+        self._op = EpDispatchCombineOp(self._cfg, comm)
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,   # [num_tokens, hidden]
+        topk_weights: torch.Tensor,    # [num_tokens, topk] fp32
+        topk_ids: torch.Tensor,        # [num_tokens, topk] (global expert ids)
+        scales: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        recv_x, _ow, _os, _oi, total_recv, routing = self._op.dispatch(
+            hidden_states, topk_weights, scales, topk_ids.to(torch.int32), return_routing=True
+        )
+        packed_x, counts, packed_src = self._op.convert_dispatch_output()
+        return {
+            "recv_x": recv_x,          # combine's input buffer handle
+            "packed_x": packed_x,      # [E_local, cap, hidden]; write expert output here in place
+            "counts": counts,          # [E_local] per-expert valid-row counts
+            "routing": routing,
+            "total_recv": int(total_recv.cpu().item()),
+        }
+
+    def combine(self, handle: dict[str, Any]) -> torch.Tensor:
+        """Reduce grouped expert outputs back to origin tokens (applies top-k weights)."""
+        self._op.convert_combine_input(handle["routing"])
+        out, _ = self._op.combine(handle["recv_x"], routing=handle["routing"])
+        return out
+
+    def reset(self) -> None:
+        self._op.reset()
+
+
+# All MoE layers in a model share the same EP shape (hidden, local experts, top-k),
+# so they should share ONE dispatcher/op — otherwise each of the N layers allocates
+# its own MORI symmetric buffers (N x memory -> OOM on large models). Keyed by shape;
+# sequential eager reuse across layers is safe (each dispatch re-populates buffers).
+_DISPATCHER_CACHE: dict[tuple, "MoriEpDispatcher"] = {}
+
+
+def get_dispatcher(
+    rank: int,
+    world_size: int,
+    hidden_dim: int,
+    num_local_experts: int,
+    num_experts_per_token: int,
+    max_num_inp_token_per_rank: int,
+    data_type: torch.dtype = torch.bfloat16,
+) -> "MoriEpDispatcher":
+    """Return a process-wide MoriEpDispatcher for this EP shape, creating it once."""
+    key = (
+        rank,
+        world_size,
+        hidden_dim,
+        num_local_experts,
+        num_experts_per_token,
+        max_num_inp_token_per_rank,
+        str(data_type),
+    )
+    disp = _DISPATCHER_CACHE.get(key)
+    if disp is None:
+        disp = MoriEpDispatcher(
+            rank=rank,
+            world_size=world_size,
+            hidden_dim=hidden_dim,
+            num_local_experts=num_local_experts,
+            num_experts_per_token=num_experts_per_token,
+            max_num_inp_token_per_rank=max_num_inp_token_per_rank,
+            data_type=data_type,
+        )
+        _DISPATCHER_CACHE[key] = disp
+    return disp

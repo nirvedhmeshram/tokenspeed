@@ -23,6 +23,7 @@ from typing import Any
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: F401
+import tokenspeed_kernel.ops.moe.mori  # noqa: F401
 import torch
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import select_kernel
@@ -59,7 +60,7 @@ def _uses_all_to_all_ep(a2a_backend: str | None) -> bool:
 
 
 def _validate_a2a_backend(a2a_backend: str | None) -> None:
-    if a2a_backend in {None, "none", "deepep"}:
+    if a2a_backend in {None, "none", "deepep", "mori"}:
         return
     raise NotImplementedError(f"MoE all-to-all backend is unsupported: {a2a_backend}")
 
@@ -172,6 +173,8 @@ def moe_plan(
     _validate_routing_mode(routing_mode)
     if solution is None and a2a_backend == "deepep":
         solution = "flashinfer_cutedsl_deepep"
+    if solution is None and a2a_backend == "mori":
+        solution = "mori"
 
     traits = _build_traits(
         weight_dtype=weight_dtype,

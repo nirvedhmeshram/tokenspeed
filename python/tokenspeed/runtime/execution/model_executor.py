@@ -1376,6 +1376,7 @@ class ModelExecutor:
 
         return result
 
+    @maybe_inference_mode()
     def execute_idle_forward(
         self,
         global_num_tokens: list[int],
