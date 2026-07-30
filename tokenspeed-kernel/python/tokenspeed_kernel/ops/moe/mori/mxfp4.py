@@ -43,37 +43,71 @@ if platform.is_amd:
     )
 
     def _grouped_mxfp4_gemm_3d(
-        packed_x: torch.Tensor, counts: torch.Tensor, w: torch.nn.Module
+        packed_x: torch.Tensor,
+        counts: torch.Tensor,
+        w: torch.nn.Module,
+        n_recv_bound: int,
     ) -> None:
         """Native MXFP4 grouped SwiGLU FFN over MORI's 3D [E,cap,H] padded buffer, IN PLACE.
 
         Bridges MORI's padded 3D layout to the triton ragged (contiguous, expert-sorted)
-        layout: gather valid rows (< counts[e]) into a flat buffer, run the mxfp4 grouped
-        GEMM on the raw packed weights (no dequant), and scatter the results back into
-        ``packed_x`` itself. Padding rows (>= counts[e]) keep their stale dispatch values;
-        MORI combine reads only valid rows via src_info, so padding is ignored. Writing in
-        place avoids a full ``[E, cap*ws, H]`` zeros allocation + copy every MoE forward
-        (~10 GB at cap=2048) — the dominant cost at large cap. Pure FFN; combine applies
-        the gate weights.
+        layout with no host sync under HIP-graph capture, so the whole MoE forward captures.
+        ``n_recv_bound`` is a STATIC (shape-derived, not ``.item()``) upper bound on the rows
+        this rank received this step, used only while capturing; the ragged buffer is sized to
+        ``m = min(E*cap, received)`` so the gather/scatter + GEMM stay proportional to real work
+        rather than the full E*cap capacity (the decisive factor for graph-mode decode
+        throughput -- sizing to E*cap moves ~E*cap rows and launches a padded-capacity grid
+        every layer).
+
+        Build a fixed-size [E*cap] permutation of slots (valid rows -- local < counts[e] --
+        first in expert-major order, padding rows after), take the first ``m`` (>= sum(counts))
+        as the ragged buffer, gather, run the mxfp4 grouped GEMM on the raw packed weights (no
+        dequant) with the real per-expert counts, then scatter back into ``packed_x`` itself.
+        Padding rows are written back unchanged; MORI combine reads only valid rows via
+        src_info, so padding is ignored. Pure FFN; combine applies the gate weights.
         """
         E, cap, H = packed_x.shape
-        counts_long = counts.to(torch.long)
-        total = int(counts_long.sum().item())
-        if total == 0:
-            return
         dev = packed_x.device
-        offsets = torch.cumsum(counts_long, 0) - counts_long          # [E] start per expert
-        expert_of_row = torch.repeat_interleave(
-            torch.arange(E, device=dev), counts_long
-        )                                                             # [total]
-        local_of_row = torch.arange(total, device=dev) - offsets[expert_of_row]
-        flat_idx = expert_of_row * cap + local_of_row                # [total] pos in [E*cap]
+        n_slots = E * cap
+        counts_long = counts.to(torch.long)
+        total = counts_long.sum()                   # sum(counts), 0-dim tensor (no host sync)
 
-        flat = packed_x.reshape(E * cap, H)
-        x_flat = flat[flat_idx]                                      # gather (copy) -> [total, H]
-        meta = make_ragged_tensor_metadata(counts.to(torch.int32), total)
-        y_flat = grouped_mxfp4_ffn(x_flat, meta, w).to(packed_x.dtype)   # [total, H]
-        flat[flat_idx] = y_flat                                      # scatter back IN PLACE
+        # Ragged-row count ``m`` (>= sum(counts)). Under HIP-graph capture host syncs are
+        # forbidden, so use the static ``n_recv_bound`` -- a true upper bound there because the
+        # decode graph pads every rank to the SAME batch (global tokens = ep_size * batch), so
+        # this rank receives at most ep_size*batch*top_k rows. Outside capture (eager, incl.
+        # non-uniform dp batches) a sync is fine, so use the EXACT count -- always correct and
+        # tighter. Either way ``m`` bounds the gather/scatter + GEMM to real work, not E*cap.
+        if torch.cuda.is_current_stream_capturing():
+            m = min(n_slots, n_recv_bound)
+        else:
+            total_i = int(total.item())
+            if total_i == 0:
+                return
+            m = min(n_slots, total_i)
+
+        # Fixed-size [E*cap] permutation of slots -> valid rows (local < counts[e]) first in
+        # expert-major order, padding rows after; take the first ``m`` as the ragged buffer.
+        # argsort on a per-slot key -- no ``.item()``, no data-dependent shape -- so the op
+        # stays HIP-graph capturable; the [:m] prefix is still collision-free (a permutation
+        # prefix), so the scatter below never double-writes a slot.
+        slot = torch.arange(n_slots, device=dev)                     # index into flat [E,cap]
+        e_of_slot = slot // cap
+        l_of_slot = slot - e_of_slot * cap
+        is_pad = (l_of_slot >= counts_long[e_of_slot]).to(torch.int64)
+        gather_idx = torch.argsort(is_pad * n_slots + slot)[:m]      # [m] unique slots
+        row = torch.arange(m, device=dev)
+
+        flat = packed_x.reshape(n_slots, H)
+        x_flat = flat[gather_idx]                                    # [m,H] valid front, pad back
+        meta = make_ragged_tensor_metadata(counts.to(torch.int32), m)
+        y_flat = grouped_mxfp4_ffn(x_flat, meta, w).to(packed_x.dtype)   # first sum(counts) rows set
+
+        # Scatter back IN PLACE. Comparing against the 0-dim ``total`` needs no host sync;
+        # gather_idx is a permutation prefix, so valid rows land in their slots collision-free
+        # and padding rows (row >= total, only present when m > sum(counts) under capture) write
+        # their own original value back -- left exactly as-is for MORI combine.
+        flat[gather_idx] = torch.where((row < total)[:, None], y_flat, x_flat)
 
     @register_kernel(
         "moe",
@@ -141,7 +175,12 @@ if platform.is_amd:
 
         handle = dispatcher.dispatch(x, topk_weights.float(), topk_ids)
         packed = handle["packed_x"]  # [E_local, cap, H]
-        _grouped_mxfp4_gemm_3d(packed, handle["counts"], w)  # in place
+        # Static upper bound on rows this rank can receive: global tokens (ep_size * this
+        # step's batch, uniform across ranks under decode graph capture) times top_k. Derived
+        # from x.shape (no host sync) so the GEMM stays graph-capturable while its ragged grid
+        # tracks real work instead of the full E_local*cap buffer.
+        n_recv_bound = ep_size * int(x.shape[0]) * int(getattr(w, "top_k"))
+        _grouped_mxfp4_gemm_3d(packed, handle["counts"], w, n_recv_bound)  # in place
         # Return the COMPLETE per-token routed result. The model consumes it via
         # forward_alltoall, which uses it directly with no framework MoE reduce for the
         # routed path (both dp=1 and dp>1). Do NOT reduce/scale here.

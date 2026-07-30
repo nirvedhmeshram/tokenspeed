@@ -144,8 +144,10 @@ def _run(quant: str) -> None:
         # masked_grouped_gemm returns a fresh tensor -> copy into the buffer
         packed.copy_(masked_grouped_gemm(packed, handle["counts"], w13_local, w2_local))
     else:
-        # native mxfp4 bridge writes into packed_x IN PLACE (returns None)
-        _grouped_mxfp4_gemm_3d(packed, handle["counts"], wmod)
+        # native mxfp4 bridge writes into packed_x IN PLACE (returns None); bound rows by the
+        # global-token upper bound (world * tokens/rank * top_k), as the registered kernel does.
+        n_recv_bound = world * T * K
+        _grouped_mxfp4_gemm_3d(packed, handle["counts"], wmod, n_recv_bound)
     out = disp.combine(handle)[:T].float()
 
     ref = _reference_moe(x, topk_ids, topk_w, ref_w13, ref_w2)

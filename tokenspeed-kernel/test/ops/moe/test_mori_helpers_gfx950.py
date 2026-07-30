@@ -180,7 +180,10 @@ def test_grouped_mxfp4_gemm_3d_bridge() -> None:
         inter = torch.nn.functional.silu(gu[:, :I]) * gu[:, I:]
         ref[e, :n] = inter @ w2_dq[e].t()
 
-    out = _grouped_mxfp4_gemm_3d(packed, counts, w)  # in place -> returns None
+    # tight bound == sum(counts): exercises the m < E*cap ragged-truncation path and checks
+    # no valid row is dropped (a too-small bound would silently lose tokens).
+    n_recv_bound = int(counts.sum().item())
+    out = _grouped_mxfp4_gemm_3d(packed, counts, w, n_recv_bound)  # in place -> returns None
     assert out is None
     got = packed  # mutated in place
 
