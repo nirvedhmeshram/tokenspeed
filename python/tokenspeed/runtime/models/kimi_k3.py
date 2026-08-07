@@ -123,7 +123,12 @@ from tokenspeed.runtime.layers.moe.latent import (
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutput, TopKOutputFormat
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_all2all_backend,
+    get_moe_backend,
+    mori_ep_capable,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -1247,6 +1252,68 @@ class KimiLinearMoE(nn.Module):
             return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
         return shared_partial
 
+    def forward_alltoall(
+        self,
+        hidden_states: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        num_global_tokens: int,
+        max_num_tokens_per_gpu: int,
+        comm_manager: "CommManager",
+        ctx: "ForwardContext",
+    ) -> torch.Tensor:
+        """MORI all-to-all EP forward for the Latent MoE, dp>1 (DP-attention/RSAG) only.
+
+        Gated to MORI by ``KimiLinearDecoderLayer.forward_mlp``. Tokens are DP-local (distinct
+        per rank); routing + routed experts run on the LOCAL tokens and the MORI kernel does
+        dispatch -> SiTU expert GEMM -> combine internally, returning the COMPLETE per-local-token
+        routed result -- so NO framework MoE all_reduce is applied to the routed path (unlike the
+        replicated-token native path whose ``LatentMoELayer`` all-reduces over the ep group).
+
+        The Latent MoE structure is preserved around the MORI experts: down_proj (H->latent) runs
+        BEFORE dispatch so MORI moves the narrow latent width; norm + up_proj (latent->H) run AFTER
+        combine. The shared expert is tp_ep-sharded (``reduce_results=False``), so it needs the full
+        batch: all-gather the local shards over ``moe.tp_ep`` (``pre_moe_comm``), compute the
+        partial, then reduce-scatter (``post_moe_comm``) -- which both sums the partials and returns
+        this rank's shard. Result accumulates onto ``prefix_sum`` (K3's AttnRes contract).
+
+        Mirrors ``DeepseekV3MoE.forward_alltoall``, adapted to the latent projections + prefix_sum.
+        """
+        num_tokens = hidden_states.shape[0]
+        router_logits = self.gate(hidden_states)
+        if num_tokens > 0:
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(
+                hidden_states.device,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+            )
+
+        # Routed path: down-project to the latent width, dispatch/expert/combine via MORI (the
+        # experts kernel returns the COMPLETE result -> no latent all_reduce here), then norm + up.
+        routed_in = self.routed_expert_down_proj(hidden_states)[0]
+        routed_latent = self.experts(
+            hidden_states=routed_in,
+            topk_output=topk_output,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+            do_finalize=True,
+        )
+        if self.routed_expert_norm is not None:
+            routed_latent = self.routed_expert_norm(routed_latent)
+        routed_out = self.routed_expert_up_proj(routed_latent)[0]
+
+        # Shared expert (tp_ep-sharded partial): all-gather -> compute -> reduce-scatter.
+        full = comm_manager.pre_moe_comm(hidden_states, ctx)
+        shared_full = self.shared_experts(full)
+        shared_local, _ = comm_manager.post_moe_comm(shared_full, None, ctx)
+
+        return add3(
+            prefix_sum,
+            routed_out.view(num_tokens, -1),
+            shared_local.view(num_tokens, -1),
+        )
+
 
 class KimiLinearDecoderLayer(nn.Module):
     """Kimi-K3 decoder layer: KDA/MLA dispatch + dense/MoE FFN + AttnRes.
@@ -1492,6 +1559,50 @@ class KimiLinearDecoderLayer(nn.Module):
             prefix_sum = None
         return h, prefix_sum
 
+    @mori_ep_capable
+    def forward_mlp(
+        self,
+        h: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        ctx: "ForwardContext",
+    ) -> torch.Tensor:
+        """FFN dispatch, accumulated onto ``prefix_sum`` (K3 AttnRes contract).
+
+        Carries the ``@mori_ep_capable`` marker: the ``--all2all-backend mori`` executor guard
+        whitelists a model iff a decoder layer's ``forward_mlp`` is so tagged. When MORI is active
+        on a MoE layer under DP-attention (RSAG: ``attn.tp_size != moe.tp_ep_size``) the routed
+        experts take the MORI all-to-all path (complete result, no framework MoE reduce); all other
+        cases keep the existing native/replicated path.
+        """
+        if not self.is_moe_layer:
+            return prefix_sum + self.mlp(h)
+        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
+            ctx
+        )
+        if get_all2all_backend().is_mori():
+            if self.comm_manager.use_all_reduce(is_moe=True):
+                # dp=1 full-EP: the native latent_reduce all_reduce would double-count MORI's
+                # COMPLETE routed result. Correct handling needs a /tp_ep_size pre-division
+                # (cf. DeepseekV3MoE.forward); scoped as a follow-up. Use --data-parallel-size>1.
+                raise NotImplementedError(
+                    "MORI EP for Kimi-K3 currently supports DP-attention (RSAG) only "
+                    "(attn.tp_size != moe.tp_ep_size); dp=1 full-EP is a follow-up."
+                )
+            return self.block_sparse_moe.forward_alltoall(
+                h,
+                prefix_sum,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                self.comm_manager,
+                ctx,
+            )
+        return self.block_sparse_moe(
+            h,
+            prefix_sum,
+            num_global_tokens=num_global_tokens,
+            max_num_tokens_per_gpu=max_num_tokens_per_gpu,
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -1582,18 +1693,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 mlp_valid_blocks,
                 out_norm=self.post_attention_layernorm,
             )
-        if self.is_moe_layer:
-            num_global_tokens, max_num_tokens_per_gpu = (
-                self.comm_manager.get_num_tokens(ctx)
-            )
-            prefix_sum = self.block_sparse_moe(
-                h,
-                prefix_sum,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-            )
-        else:
-            prefix_sum = prefix_sum + self.mlp(h)
+        prefix_sum = self.forward_mlp(h, prefix_sum, ctx)
         return prefix_sum, block_residual
 
 
