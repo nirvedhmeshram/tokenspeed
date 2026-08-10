@@ -101,6 +101,8 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce_two,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
+    token_all_gather,
+    token_reduce_scatter,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.cuda_graph_wrapper import get_is_capture_mode
@@ -1587,11 +1589,19 @@ class KimiLinearDecoderLayer(nn.Module):
         self._attn_split = False
         # True when the NEXT layer folds our routed+shared residual accumulate
         # into its attn-side combine (we return the parts unsummed).
+        # ``prev_is_moe`` gates ``pre_attn_comm``'s gather via
+        # ``use_all_reduce(prev_is_moe)``; for AttnRes it means "the previous
+        # layer left tokens in the scattered (RSAG) space", which under
+        # DP-attention is true of every layer after layer 0 -- layer 0 alone
+        # receives the full attn-dp batch straight from the embedding.
+        # In AllReduce mode (attn.tp_size == moe.tp_ep_size) this stays a no-op:
+        # use_all_reduce(True) is then True and pre_attn_comm returns unchanged,
+        # exactly as with the previous hard-coded False.
         self.comm_manager = CommManager(
             mapping=mapping,
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
-            prev_is_moe=False,
+            prev_is_moe=layer_id > 0,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
         )
@@ -1600,9 +1610,16 @@ class KimiLinearDecoderLayer(nn.Module):
         self,
         attn_partial: torch.Tensor,
         prefix_sum: torch.Tensor | None,
+        ctx: "ForwardContext",
         combine: tuple | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """All-reduce the attention partial and accumulate the residual.
+        """Reduce the attention partial and accumulate the residual.
+
+        AllReduce mode all-reduces over the attention TP group and leaves the
+        stream in the full attn-dp token space. RSAG mode (DP-attention)
+        reduce-scatters instead, so the stream leaves this layer in the
+        scattered space the MoE all-to-all path expects; the attention input is
+        gathered back by ``pre_attn_comm`` on the next layer.
 
         Small batches fold the residual add into the one-shot AR kernel;
         with ``combine = (scratch, res_w, rms_w, out_norm_w, eps)`` the
@@ -1610,6 +1627,22 @@ class KimiLinearDecoderLayer(nn.Module):
         hidden comes back as the second return (else None -- block-write
         layers, large batches and the plain-reduce fallback).
         """
+        if self._rsag_active():
+            # RSAG: both fused entry points below are all-reduce kernels with no
+            # reduce-scatter counterpart, so the fast path is unavailable here.
+            # Note this is gated on the stack-wide mode, not this layer's own
+            # ``use_all_reduce(is_moe_layer)``: the dense layer 0 must scatter
+            # too, otherwise its mlp-side ``_apply_attn_res`` would mix a full
+            # prefix_sum against an already-scattered block snapshot.
+            reduced = token_reduce_scatter(
+                attn_partial,
+                group=self.mapping.attn.tp_group,
+                scattered_num_tokens=(
+                    self.comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+                ),
+            )
+            return (reduced if prefix_sum is None else prefix_sum + reduced), None
+
         num_tokens = attn_partial.shape[0]
         if (
             prefix_sum is not None
@@ -1651,7 +1684,10 @@ class KimiLinearDecoderLayer(nn.Module):
         return (reduced if prefix_sum is None else prefix_sum + reduced), None
 
     def _mix_into_attention(
-        self, hidden_states: torch.Tensor, block_residual: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """AttnRes entry: mix the residual candidates into the attention input.
 
@@ -1662,6 +1698,9 @@ class KimiLinearDecoderLayer(nn.Module):
         n_tok = prefix_sum.shape[0]
         fast_mix = (
             self._attn_split
+            # See forward(): the split/dual AttnRes partials are disabled under
+            # RSAG, so the scratch this path would read is never filled.
+            and not self._rsag_active()
             and 0 < n_tok <= ATTNRES_FAST_PATH_MAX_TOKENS
             and prefix_sum.is_cuda
             and self.prev_valid_blocks > 0
@@ -1687,7 +1726,18 @@ class KimiLinearDecoderLayer(nn.Module):
                 out_norm=self.input_layernorm,
             )
         if self.is_block_write_layer:
-            block_residual[self.block_write_idx] = prefix_sum  # snapshot
+            snapshot = prefix_sum
+            if snapshot.shape[0] != block_residual.shape[1]:
+                # Layer 0 only: the stream is still the full attn-dp batch (the
+                # reduce-scatter happens at this layer's attention), while the
+                # snapshot buffer is sized to the scattered shard. The stream is
+                # replicated across the attention TP group here, so taking our
+                # own rows is a slice, not a collective -- and it matches what
+                # every later slot holds.
+                token_list = self.comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+                offset = sum(token_list[: self.mapping.attn.tp_rank])
+                snapshot = snapshot[offset : offset + block_residual.shape[1]]
+            block_residual[self.block_write_idx] = snapshot
             prefix_sum = None
         return h, prefix_sum
 
@@ -1707,7 +1757,27 @@ class KimiLinearDecoderLayer(nn.Module):
         cases keep the existing native/replicated path.
         """
         if not self.is_moe_layer:
-            return prefix_sum + self.mlp(h)
+            # The dense MLP is TP-sharded over dense.tp and all-reduces its own
+            # output, so it needs the full attn-dp batch -- but under RSAG the
+            # stream is already this rank's shard (layer 0's attention scattered
+            # it). ``pre_dense_comm`` is not the right helper here: it keys off
+            # dense.tp == attn.tp, which is true, so it would skip the gather.
+            # Gather explicitly, then scatter the result back.
+            if not self._rsag_active():
+                return prefix_sum + self.mlp(h)
+            token_list = self.comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+            dense_out = self.mlp(
+                token_all_gather(
+                    h,
+                    group=self.mapping.attn.tp_group,
+                    scattered_num_tokens=token_list,
+                )
+            )
+            return prefix_sum + token_reduce_scatter(
+                dense_out,
+                group=self.mapping.attn.tp_group,
+                scattered_num_tokens=token_list,
+            )
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
@@ -1735,6 +1805,17 @@ class KimiLinearDecoderLayer(nn.Module):
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
         )
 
+    def _rsag_active(self) -> bool:
+        """True when DP-attention puts the stack in RSAG (scattered) token space.
+
+        Stack-wide, not per-layer: the MoE layers set the inter-layer space, and
+        the dense layer 0 has to follow them so the AttnRes stream and the block
+        snapshots agree on their row count.
+        """
+        if not self.mapping.has_attn_tp:
+            return False
+        return not self.comm_manager.use_all_reduce(True)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1744,7 +1825,7 @@ class KimiLinearDecoderLayer(nn.Module):
         out_cache_loc: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
+        h, prefix_sum = self._mix_into_attention(hidden_states, block_residual, ctx)
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
         # the combine after the attention AR only touches the prefix candidate.
@@ -1756,6 +1837,15 @@ class KimiLinearDecoderLayer(nn.Module):
             0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
             and h.is_cuda
             and mlp_valid_blocks > 0
+            # Disabled under RSAG: this scratch is sized from the PRE-attention
+            # rows, but the attention reduce-scatters, so on the dense layer 0
+            # (whose input is the full attn-dp batch) the mlp-side combine would
+            # meet a scratch of the wrong length. The layer0->layer1 dual-partial
+            # pairing is unsafe for the same reason -- the two layers no longer
+            # see the same token count, so they can straddle the size threshold.
+            # Correctness first; re-enabling these is a follow-up alongside the
+            # fused reduce-scatter+residual path.
+            and not self._rsag_active()
         )
         scratch = _sliced_scratch(h, 0, num_tokens) if split_mix else None
         # The next layer's attn-side partial reads the same (now final) block
@@ -1802,7 +1892,7 @@ class KimiLinearDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
             )
             prefix_sum, h_fused = self._reduce_attn_accumulate(
-                attn_out, prefix_sum, combine=ar_combine
+                attn_out, prefix_sum, ctx, combine=ar_combine
             )
         # --- mlp: AttnRes mixing -> norm -> FFN -> accumulate ---
         if h_fused is not None:
@@ -1936,6 +2026,32 @@ class KimiLinearModel(nn.Module):
         del layer_idx, block_residual
         return prefix_sum.clone()
 
+    def _rsag_active(self) -> bool:
+        """True when DP-attention puts the stack in RSAG (scattered) token space.
+
+        Mirrors ``CommManager.use_all_reduce(is_moe=True)``: the MoE layers drive
+        the inter-layer space, and they run RSAG exactly when the attention TP
+        size differs from the MoE tp_ep size.
+        """
+        if not self.mapping.has_attn_tp:
+            return False
+        return not self.layers[0].comm_manager.use_all_reduce(True)
+
+    def _rsag_shard(self, ctx: "ForwardContext", total_rows: int) -> tuple[int, int]:
+        """This rank's ``(offset, rows)`` within the full attn-dp batch.
+
+        Returns ``(0, total_rows)`` in AllReduce mode, on the idle forward mode,
+        or when the scattered table does not describe ``total_rows`` -- i.e.
+        whenever the caller is not in the attn-dp token space this shard assumes.
+        """
+        if not self._rsag_active() or ctx.forward_mode.is_idle():
+            return 0, total_rows
+        token_list = self.layers[0].comm_manager.attn_tp_group_scattered_num_tokens(ctx)
+        if sum(token_list) != total_rows:
+            return 0, total_rows
+        rank = self.mapping.attn.tp_rank
+        return sum(token_list[:rank]), token_list[rank]
+
     @torch.no_grad()
     def forward(
         self,
@@ -1951,14 +2067,26 @@ class KimiLinearModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(input_ids)
 
+        # The stream enters FULL (the embedding is replicated across the
+        # attention TP group), which is what ``pre_attn_comm``'s layer-0 skip
+        # assumes. K3's layer 0 is dense and runs AllReduce, so the stream stays
+        # full across it; layer 1 is the first MoE/RSAG layer and slices the
+        # stream into this rank's shard, where it stays for the rest of the
+        # stack. Layer 0's block snapshot is sliced to match (see
+        # ``_mix_into_attention``).
+        prefix_sum = hidden_states
+        _, local_rows = self._rsag_shard(ctx, hidden_states.size(0))
+
         # Per-forward AttnRes scratch, block-major so block_residual[:m] is a
         # contiguous kernel slice (fresh alloc = CUDA-graph safe); new_empty is
         # safe: slot j is written at layer j*block_size before any read.
+        # Sized to the scattered rows: every slot but layer 0's is written from
+        # the post-reduce-scatter stream, and layer 0's is sliced to match.
         num_blocks = ceil_div(
             self.config.num_hidden_layers, self.config.attn_res_block_size
         )
         block_residual = hidden_states.new_empty(
-            num_blocks, hidden_states.size(0), hidden_states.size(1)
+            num_blocks, local_rows, hidden_states.size(1)
         )
 
         capture_layers = self.layers_to_capture
@@ -1968,7 +2096,6 @@ class KimiLinearModel(nn.Module):
             [] if capture_dflash or capture_eagle3 else None
         )
 
-        prefix_sum = hidden_states
         for layer_idx, layer in enumerate(self.layers):
             prefix_sum, block_residual = layer(
                 positions, prefix_sum, ctx, out_cache_loc, block_residual
@@ -1997,6 +2124,14 @@ class KimiLinearModel(nn.Module):
             self.output_attn_res_norm,
             num_blocks,
             out_norm=self.norm,
+        )
+        # RSAG exit: the last layer is MoE, so the stream is still this rank's
+        # shard. Hand the full attn-dp batch back to the caller (lm_head/logits)
+        # using the shared helper, which keeps K3 on the same padding and
+        # scattered_num_tokens conventions as every other model. No-op in
+        # AllReduce mode.
+        hidden_states, _ = self.layers[-1].comm_manager.post_final_norm_comm(
+            hidden_states, None, ctx
         )
         return hidden_states, aux_hidden_states
 
