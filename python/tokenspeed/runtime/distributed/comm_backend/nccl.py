@@ -236,6 +236,20 @@ class NcclBackend(CommBackend):
         hidden = tensor.size(-1)
 
         local_tokens = tensor.size(0)
+        if local_tokens > max_tokens:
+            # The caller's rows must be one of the scattered shards. Overshooting
+            # means the tensor is still in a wider token space than the table
+            # describes (e.g. a model whose layers never reduce-scattered under
+            # RSAG, so rows are the full attn-dp batch rather than this rank's
+            # shard). Without this check the oversized tensor flows into
+            # all_gather_into_tensor, whose output-vs-input size assertion fails
+            # with a message that points at NCCL instead of the token bookkeeping.
+            raise ValueError(
+                f"token_all_gather got {local_tokens} local rows but the "
+                f"scattered table allows at most {max_tokens} "
+                f"(scattered_num_tokens={scattered_num_tokens}); the input is "
+                "not in this group's scattered token space"
+            )
         if local_tokens < max_tokens:
             pad = torch.zeros(
                 max_tokens - local_tokens,
