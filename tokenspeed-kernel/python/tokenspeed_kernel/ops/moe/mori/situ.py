@@ -220,6 +220,8 @@ if platform.is_amd:
         # idle/imbalanced ranks still process the rows peers routed to their experts.
         per_rank = max(int(max_num_tokens_per_gpu or 0), int(x.shape[0]))
         n_recv_bound = ep_size * per_rank * top_k
-        _grouped_a16w4_situ_gemm_3d(packed, handle["counts"], w, n_recv_bound)  # in place
+        _grouped_a16w4_situ_gemm_3d(
+            packed, handle["counts"], w, n_recv_bound
+        )  # in place
         # Return the COMPLETE per-token routed result on every rank; do NOT reduce/scale here.
         return dispatcher.combine(handle)

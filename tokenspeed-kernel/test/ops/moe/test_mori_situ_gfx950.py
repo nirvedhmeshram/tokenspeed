@@ -79,7 +79,8 @@ def _make_module(num_local: int, L: int, I: int, gen: torch.Generator):
 
 def _expert_major_valid_rows(packed: torch.Tensor, counts_list: list[int]):
     """Gather valid rows in the SAME expert-major/local order the bridge uses, plus their
-    local expert ids -- so a single-route (weight=1) reference is row-aligned to the bridge."""
+    local expert ids -- so a single-route (weight=1) reference is row-aligned to the bridge.
+    """
     rows, ids = [], []
     for e, n in enumerate(counts_list):
         for r in range(n):
@@ -107,7 +108,9 @@ def test_grouped_a16w4_situ_gemm_3d_bridge() -> None:
     w, raw = _make_module(E, L, I, gen)
 
     # padding rows deliberately non-zero -- must be left untouched by the gather/scatter
-    packed = torch.randn(E, cap, L, generator=gen, device=dev, dtype=torch.bfloat16) * 0.1
+    packed = (
+        torch.randn(E, cap, L, generator=gen, device=dev, dtype=torch.bfloat16) * 0.1
+    )
     packed_before = packed.clone()
 
     # reference: pure per-row SiTU FFN over the ORIGINAL valid rows (single local route, w=1)
