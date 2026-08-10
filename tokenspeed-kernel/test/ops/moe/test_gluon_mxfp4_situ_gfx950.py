@@ -25,18 +25,13 @@ import torch
 from kimi3_reference import (
     a16w4_mxfp4_moe_reference,
 )
-from utils import make_mxfp4_moe_weights, make_round_robin_topk
+from utils import is_cdna4, make_mxfp4_moe_weights, make_round_robin_topk
 
-
-def _is_gfx950() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
-    return "gfx950" in arch
-
-
-if not _is_gfx950():
-    pytest.skip("MXFP4 SiTU Gluon tests require gfx950", allow_module_level=True)
+if not is_cdna4():
+    pytest.skip(
+        "AMD CDNA4 is required for Gluon MXFP4 SiTU tests",
+        allow_module_level=True,
+    )
 
 import tokenspeed_kernel  # noqa: E402
 
@@ -71,7 +66,7 @@ def _make_mxfp4_module(
     return module, raw
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_ep_decode_matches_kimi_k3_shape_gfx950(
     num_tokens: int,
 ) -> None:
@@ -166,7 +161,7 @@ def test_ep_decode_matches_kimi_k3_shape_gfx950(
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
 def test_ep_decode_all_remote_routes_return_zero_gfx950(
     num_tokens: int,
 ) -> None:

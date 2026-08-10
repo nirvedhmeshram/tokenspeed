@@ -136,7 +136,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
         # A draft consumes its history group table from the wrapper's
         # per-group distribution (_draft_group_tables); the target reads the
         # richer cache_metadata instead (see FlashMLABackend for rationale).
-        self.uses_cache_groups = bool(getattr(config, "is_draft", False))
+        self.uses_cache_groups = bool(config.is_draft)
         self.max_num_pages = self._calc_padded_blocks(config.context_len)
 
         # MLA dimensions
@@ -176,23 +176,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             blocks = triton.cdiv(blocks, constraint) * constraint
         return blocks
 
-    def mark_cache_contract(self, logical_page_size: int | None = None) -> None:
-        """Record the scheduler page size used by an LCM-backed draft pool."""
-        if logical_page_size is not None:
-            logical_page_size = int(logical_page_size)
-            if logical_page_size <= 0 or logical_page_size % self.page_size:
-                raise ValueError(
-                    f"logical page size {logical_page_size} is not a positive multiple "
-                    f"of the trtllm_mla kernel page size {self.page_size}"
-                )
-        super().mark_cache_contract(logical_page_size)
-
     def _create_block_kv_indices(
         self,
         batch_size: int,
         max_blocks: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
         page_table: torch.Tensor,
         block_kv_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -232,9 +219,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
     ):
         cache_metadata = kwargs.pop("cache_metadata", None)
         forward_batch = kwargs.pop("forward_batch", None)
-        draft_group_table = self._resolve_draft_group_table(
-            kwargs.pop("block_tables", None)
-        )
+        kwargs.pop("block_tables", None)
         group_table = None
         logical_page_size = None
         if cache_metadata is not None:
@@ -242,14 +227,10 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, forward_batch, bs
             )
-        elif draft_group_table is not None:
-            group_table, logical_page_size = self._bind_draft_group_table(
-                draft_group_table, bs
-            )
         elif self._draft_reads_batch_pages(bs, forward_mode):
             # The drafter drives this backend directly and passes no cache
             # metadata; the batch-ordered draft page table (row i is batch
-            # position i) carries the scheduler pages.
+            # position i) carries kernel pages published by DraftPageStaging.
             self._cache_groups_bound = True
         if forward_mode.is_extend_or_mixed():
             self._init_prefill_metadata(
@@ -332,9 +313,7 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
                 q_len_per_req=q_len_per_req,
             )
         else:
-            block_kv_indices = self._create_block_kv_indices(
-                bs, max_blocks, req_pool_indices, seq_lens, page_table
-            )
+            block_kv_indices = self._create_block_kv_indices(bs, max_blocks, page_table)
 
         assert (
             seq_lens.dtype == torch.int32
@@ -544,23 +523,19 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self.cuda_graph_seq_lens_buf[:bs].copy_(seq_lens[:bs])
 
         cache_metadata = kwargs.get("cache_metadata")
-        draft_group_table = self._resolve_draft_group_table(kwargs.get("block_tables"))
         group_table = None
         logical_page_size = None
         if self._cache_groups_bound and cache_metadata is not None:
             group_table, logical_page_size = self._resolve_full_history_table(
                 cache_metadata, kwargs.get("forward_batch"), 0
             )
-        elif draft_group_table is not None:
-            # Already padded to the replay bs by the wrapper.
-            group_table, logical_page_size = self._bind_draft_group_table(
-                draft_group_table, bs
-            )
         elif self._draft_reads_batch_pages(bs, forward_mode) and (
             page_table is not None
         ):
+            # DraftPageStaging.publish already expanded into kernel pages, so
+            # the staged table is read with an identity expand (logical==kernel).
             group_table = page_table[:bs]
-            logical_page_size = self._cache_logical_page_size
+            logical_page_size = self.page_size
         if group_table is not None:
             real_bs = min(int(group_table.shape[0]), bs)
             if real_bs > 0 and not self._block_table_aliased:
@@ -588,16 +563,11 @@ class TRTLLMMLABackend(MlaCacheGroupMixin, AttentionBackend):
             self._create_block_kv_indices(
                 bs,
                 metadata.block_kv_indices.shape[1],
-                req_pool_indices[:bs],
-                seq_lens[:bs],
                 page_table,
                 metadata.block_kv_indices,
             )
 
         self.forward_decode_metadata = metadata
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Publish block-end cache lengths inside a captured draft graph.

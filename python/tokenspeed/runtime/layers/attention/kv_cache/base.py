@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import zero_byte_segments
+from tokenspeed_kernel.ops.kvcache.triton import zero_byte_ranges
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     PagedCacheRuntimeContract,
@@ -38,7 +38,7 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
-    from tokenspeed.runtime.cache.kvstore_controller import LayerDoneCounter
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 
 logger = get_colorful_logger(__name__)
 
@@ -62,6 +62,8 @@ class CachePool:
         *,
         paged_cache_group_specs: tuple[PagedCacheGroupSpec, ...] = (),
         token_capacity: int | None = None,
+        backing_pool: CachePool | None = None,
+        field_layer_offset: int = 0,
     ):
         self.dtype = dtype
         self.rank = rank
@@ -74,6 +76,9 @@ class CachePool:
             self.store_dtype = dtype
         self.device = device
         self.plan = memory_plan
+        self._field_layer_offset = int(field_layer_offset)
+        if self._field_layer_offset < 0:
+            raise ValueError("field_layer_offset must be non-negative")
         # The cache recipe is the single source of the scheduler group specs
         # (CachePoolSpec.paged_cache_group_specs); the pool aligns their
         # physical fields with the memory plan and publishes the runtime
@@ -90,11 +95,38 @@ class CachePool:
         # Allocate lazily when the first field is bound. Concrete pools do
         # that inside their memory-saver region, so the shared buffer keeps
         # the same sleep/wake lifetime as the legacy per-buffer allocations.
-        self.buffer: torch.Tensor | None = None
-        self._fields: dict[str, torch.Tensor] = {}
+        #
+        # A heterogeneous draft view (for example, an MHA Eagle3 head over an
+        # MLA target) binds its own field family but must not allocate another
+        # arena. Construction is deliberately target-first: the draft aliases
+        # the target's already-registered buffer and field registry. Sharing
+        # the registry is also required by pd_contract(), which validates that
+        # every field in the merged plan has acquired a runtime dtype.
+        self._backing_pool = backing_pool
+        if backing_pool is None:
+            self.buffer: torch.Tensor | None = None
+            self._fields: dict[str, torch.Tensor] = {}
+        else:
+            if backing_pool.plan != memory_plan:
+                raise ValueError("a cache view must share its backing pool's plan")
+            if backing_pool.buffer is None:
+                raise ValueError(
+                    "the backing cache pool must bind its fields before a view"
+                )
+            if paged_cache_group_specs:
+                raise ValueError(
+                    "a cache view must inherit, not republish, the runtime contract"
+                )
+            self.buffer = backing_pool.buffer
+            self._fields = backing_pool._fields
+            self.runtime_contract = backing_pool.runtime_contract
+            self.paged_cache_group_specs = backing_pool.paged_cache_group_specs
+            self.paged_cache_group_page_counts = (
+                backing_pool.paged_cache_group_page_counts
+            )
 
         # default state for optional layer-wise transfer control
-        self.layer_transfer_counter = None
+        self.layerwise_load_tracker = None
         logger.info(
             f"Initialized token to kv pool with size {size}, dtype {dtype}, device {device}, page size {page_size}, rank {rank}"
         )
@@ -220,7 +252,7 @@ class CachePool:
             for segment in self._block_byte_segments(group_id, block_ids)
         ]
         if segments:
-            zero_byte_segments(buffer, segments)
+            zero_byte_ranges(buffer, segments)
 
     def pd_contract(self, group_specs):
         buffer = self._ensure_buffer()
@@ -245,6 +277,12 @@ class CachePool:
         )
 
     def _ensure_buffer(self) -> torch.Tensor:
+        if self._backing_pool is not None:
+            buffer = self._backing_pool.buffer
+            if buffer is None:
+                raise RuntimeError("the backing cache pool released its buffer")
+            self.buffer = buffer
+            return buffer
         if self.buffer is None:
             self.buffer = torch.zeros(
                 self.plan.arena_bytes,
@@ -284,15 +322,58 @@ class CachePool:
             for field in fields
         ]
 
-    def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
-        self.layer_transfer_counter = layer_transfer_counter
+    def register_layerwise_load_tracker(
+        self, layerwise_load_tracker: LayerwiseLoadTracker
+    ) -> None:
+        self.layerwise_load_tracker = layerwise_load_tracker
 
     def bind_paged_cache_scheduler(self, scheduler: object) -> None:
         """Optional hook for model-specific paged-cache diagnostics."""
 
+    def cache_transfer_layout(self):
+        """Return the byte contract used by Host cache transfers."""
+        from tokenspeed.runtime.cache.transfer.layout import (
+            layout_from_lcm_plan,
+            select_layer_fields,
+        )
+
+        try:
+            layer_num = self.layer_num
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"{type(self).__name__} must expose layer_num for Host L2"
+            ) from exc
+        try:
+            field_ids, consumers = select_layer_fields(
+                self.plan.fields,
+                first_layer=self._field_layer_offset,
+                num_layers=layer_num,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        local_group_ids = {
+            field.group_id for field in self.plan.fields if field.field_id in field_ids
+        }
+        scheduler_group_ids = tuple(
+            spec.group_id
+            for spec in self.paged_cache_group_specs
+            if spec.group_id in local_group_ids
+        )
+        return layout_from_lcm_plan(
+            self.plan,
+            self._ensure_buffer(),
+            consumers=consumers,
+            group_ids=scheduler_group_ids or None,
+            field_ids=field_ids,
+        )
+
     @torch.no_grad()
     def clear_kv_buffers(self) -> None:
         """Zero the shared cache buffer after sleep/wake remaps its storage."""
+        # The event loop visits both target and draft pools. A draft view owns
+        # no allocation; the target clears their shared arena exactly once.
+        if self._backing_pool is not None:
+            return
         if self.buffer is not None:
             self.buffer.zero_()
 
@@ -403,7 +484,7 @@ class LayerMappedKVPool:
     # so the global id must be mapped to its pool slot first (mirrors
     # ``set_kv_buffer``). Reached via the DeepseekV3-style MLA chunked-prefill
     # path (Kimi-K3).
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope, sanitize=True):
         # Prefill breakable-graph padding contract: the dummy-batch capture (and
         # bucket-padding rows) whose ``out_cache_loc`` is the reserved
         # ``dummy_kv_slot`` can carry NaN into this fp8 KV write. The paged MLA
@@ -421,7 +502,7 @@ class LayerMappedKVPool:
                 loc,
                 cache_k_nope,
                 cache_k_rope,
-                sanitize=True,
+                sanitize=sanitize,
             )
 
     def get_mla_kv_buffer(self, layer, loc, dst_dtype=None):

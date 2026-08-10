@@ -158,6 +158,8 @@ class HybridMHATokenToKVPool(MHATokenToKVPool):
             raise ValueError(f"layer {layer_id} has no bound state fields") from exc
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         conv, recurrent = self.get_state_buffers(layer_id)
         if component_name == "conv_state":
             return conv
@@ -188,11 +190,17 @@ class HybridMHATokenToKVPoolMXFP8(
         self.store_dtype = torch.float8_e4m3fn
         super()._create_buffers()
         self.k_scale_buffer = [
-            self.field(f"layer.{layer_id}.k_scale", torch.float8_e8m0fnu)
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.k_scale",
+                torch.float8_e8m0fnu,
+            )
             for layer_id in range(self.layer_num)
         ]
         self.v_scale_buffer = [
-            self.field(f"layer.{layer_id}.v_scale", torch.float8_e8m0fnu)
+            self.field(
+                f"layer.{self._field_layer_id(layer_id)}.v_scale",
+                torch.float8_e8m0fnu,
+            )
             for layer_id in range(self.layer_num)
         ]
 

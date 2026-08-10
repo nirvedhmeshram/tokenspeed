@@ -72,13 +72,13 @@ logger = get_colorful_logger(__name__)
 class LlamaAttention(BaseLlamaAttention):
     """Eagle3 draft head attention.
 
-    Inherits ``__init__`` (with ``qkv_input_size=2*hidden_size`` for the
-    [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj scaffolding)
-    from base. Overrides ``_attn`` so the draft's first step skips dead
-    catch-up rows: on backends that support fused KV pre-write, q is sliced
-    to one live row per request and dispatched as DECODE; otherwise the
-    fallback runs the full N-row attn and post-slices the output. Inactive
-    draft steps delegate to base.
+    Inherits the projection setup (with ``qkv_input_size=2*hidden_size`` for
+    the [embed || hidden] concat) and ``forward`` (= qkv_proj + o_proj
+    scaffolding) from base. Overrides ``_attn`` so the draft's first step
+    skips dead catch-up rows: on backends that support fused KV pre-write, q
+    is sliced to one live row per request and dispatched as DECODE; otherwise
+    the fallback runs the full N-row attn and post-slices the output.
+    Inactive draft steps delegate to base.
     """
 
     def _attn(
