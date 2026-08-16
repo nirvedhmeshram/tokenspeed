@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
+
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import Platform
 
