@@ -87,7 +87,15 @@ DEFAULT_SMG_POLICY = "passthrough"
 _DEFAULT_SMG_DISABLE_FLAGS = (
     "--disable-circuit-breaker",
     "--disable-retries",
-    "--disable-load-monitoring",
+    # LOCAL WORKAROUND -- do not upstream.
+    # #1205 started injecting --disable-load-monitoring, but no published
+    # tokenspeed-smg accepts it (checked through 1.10.0.post20260825, newer than
+    # the pin in python/pyproject.toml), so the gateway exits rc=2 with
+    # "unrecognized arguments" and ts serve never becomes healthy. This is the
+    # same pin-lockstep hazard the _default_policy docstring calls out for
+    # --policy. Dropping the flag restores the pre-#1205 behaviour that all of
+    # our earlier measurements ran with.
+    # "--disable-load-monitoring",
 )
 
 
