@@ -131,6 +131,8 @@ def _build_comm(device: torch.device, *, latent_tail=None):
     # Replicated projection (no shard group): the tiers take their
     # _replicated variants, matching the full-width reference below.
     comm._shard_up_projection = up_proj.shard_group is not None
+    # __init__ is bypassed here; no symmetric heap in unit tests.
+    comm._symm_join_lane = None
 
     comm.mapping = SimpleNamespace(
         moe=SimpleNamespace(
@@ -378,6 +380,8 @@ def test_profit_cap_stops_the_fused_tail_below_its_capacity(monkeypatch):
     comm.execution_plan = SimpleNamespace(fused_moe_ar=True, join_moe_reduce=True)
     comm.state = SimpleNamespace(multimem_ar_ok=False)
     comm._shard_up_projection = False
+    # __init__ is bypassed here; no symmetric heap in unit tests.
+    comm._symm_join_lane = None
     comm.routed_hidden, comm.hidden_size = L, H
 
     cap = mod.TAIL_FUSION_MAX_TOKENS
@@ -412,6 +416,8 @@ def test_tail_fusion_plan_defer_decision(monkeypatch):
         )
         comm.state = SimpleNamespace(multimem_ar_ok=False)
         comm._shard_up_projection = False
+        # __init__ is bypassed here; no symmetric heap in unit tests.
+        comm._symm_join_lane = None
         comm.routed_hidden, comm.hidden_size = L, H
         return comm
 

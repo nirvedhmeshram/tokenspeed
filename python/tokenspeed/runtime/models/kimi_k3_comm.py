@@ -62,7 +62,9 @@ from tokenspeed_kernel.ops.moe.latent_tail import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_ops import (
+    acquire_all_reduce_outputs,
     all_reduce,
+    can_acquire_all_reduce_outputs,
     prepare_all_reduce_fusion,
     prepare_all_reduce_lane,
 )
@@ -531,6 +533,28 @@ def _tail_finalize_top_k(
     return None
 
 
+def _acquire_symm_join_lane(*, mapping, width: int, enabled: bool):
+    """Acquire the join lane from symmetric memory, or None.
+
+    Collective: every rank of the MoE TP x EP group must reach this with
+    identical arguments. It runs from ``K3MoeTailComm.__init__``, which every
+    rank enters in the same layer order, and every input is static
+    configuration -- so the ranks cannot disagree on whether a lane exists.
+
+    The lane is one ``[1, width]`` row because the join tier only uses it for
+    single-token decode (see ``allreduce_fusion_lane``); wider batches take the
+    concatenated or grouped path, where the staging copy is amortized.
+    """
+    if not enabled or mapping.moe.tp_ep_size <= 1:
+        return None
+    like = torch.empty(0, dtype=torch.bfloat16, device="cuda")
+    shapes = ((1, width),)
+    group = mapping.moe.tp_ep_group
+    if not can_acquire_all_reduce_outputs(shapes, like, group):
+        return None
+    return acquire_all_reduce_outputs(shapes, like, group)[0]
+
+
 class K3MoeTailComm:
     """MoE-tail routing and execution for one KimiLinearMoE module.
 
@@ -573,6 +597,23 @@ class K3MoeTailComm:
         # Derived from the projection itself (built with a shard group iff
         # _shard_k3_up_projection held), so comm and module cannot disagree.
         self._shard_up_projection = up_proj.shard_group is not None
+        # Producer-direct join lane, acquired once here because construction is
+        # collective and the buffer must outlive graph capture.
+        #
+        # allreduce_fusion_lane hands back ordinary memory, so the experts write
+        # their partials into it and the reduction then stages a copy into the
+        # symmetric heap. Acquiring the lane from the heap instead lets the same
+        # producer-direct writes land where the reduction already reads, turning
+        # a staged one-shot into an in-place symmetric reduce -- the path EP-only
+        # layouts already take through latent_moe_expert_shared_all_reduce.
+        #
+        # None when the backend has no symmetric memory to offer; plan() then
+        # falls back to the ordinary lane.
+        self._symm_join_lane = _acquire_symm_join_lane(
+            mapping=mapping,
+            width=routed_hidden + hidden_size,
+            enabled=not self._shard_up_projection,
+        )
         self.latent_tail = None
         if self.state.latent_tail_ok:
             # Deferred-finalize arming (rank-uniform). The gate is the
@@ -666,13 +707,29 @@ class K3MoeTailComm:
                 ),
             )
         # Shard mode splits the joined reduction, so it cannot use the packed lane.
-        lane = allreduce_fusion_lane(
-            hidden_states,
-            self.routed_hidden + self.hidden_size,
-            enabled=(
-                tier is K3MoETailTier.FUSED_LANE_AR and not self._shard_up_projection
-            ),
+        lane_enabled = (
+            tier is K3MoETailTier.FUSED_LANE_AR and not self._shard_up_projection
         )
+        lane = None
+        if (
+            lane_enabled
+            and self._symm_join_lane is not None
+            and hidden_states is not None
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] == 1
+            and hidden_states.dtype == self._symm_join_lane.dtype
+        ):
+            # Same producer-direct contract as the ordinary lane, but the
+            # partials land in symmetric memory, so the join reduces them in
+            # place instead of staging a copy first. Gated on the single-token
+            # shape allreduce_fusion_lane itself requires.
+            lane = self._symm_join_lane
+        else:
+            lane = allreduce_fusion_lane(
+                hidden_states,
+                self.routed_hidden + self.hidden_size,
+                enabled=lane_enabled,
+            )
         return TailPlan(
             tier=tier,
             lane=lane,
