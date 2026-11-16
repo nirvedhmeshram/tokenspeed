@@ -20,6 +20,7 @@
 
 
 import logging
+import os
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import replace
@@ -318,7 +319,9 @@ class MoELayer(torch.nn.Module):
                     "Gluon Petit MegaMoE currently requires AMD CDNA4 (gfx950)"
                 )
             mapping = global_server_args_dict["mapping"]
-            if mapping.nnodes != 1:
+            # Prototype: TOKENSPEED_PETIT_NODE_SIZE selects the two-level
+            # (Petit inside a node, RCCL GIN across two nodes) kernel path.
+            if mapping.nnodes != 1 and not os.environ.get("TOKENSPEED_PETIT_NODE_SIZE"):
                 raise ValueError("Gluon Petit MegaMoE currently supports one node only")
             if mapping.moe.tp_size != 1 or self.tp_size != 1:
                 raise ValueError(

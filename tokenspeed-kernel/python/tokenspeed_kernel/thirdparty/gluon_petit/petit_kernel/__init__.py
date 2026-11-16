@@ -317,7 +317,7 @@ class MegaMoeConfig:
         )
         deepseek_v41_config = (
             self.world_size in (4, 8)
-            and (self.num_experts, self.topk) in ((384, 6), (128, 3))
+            and (self.num_experts, self.topk) in ((384, 6), (192, 6), (128, 3))
             and self.model_dim == 5120
             and self.inter_dim == 2560
             and not self.has_bias
