@@ -3038,6 +3038,19 @@ class _Workspace:
     config: Any
     heap: Any
     inputs: Any
+    # Prototype two-level EP across nodes (see _petit_node_size); None on one node.
+    hier: Any = None
+
+
+def _petit_node_size() -> int | None:
+    """GPUs per node for the prototype two-level Petit EP, from
+    TOKENSPEED_PETIT_NODE_SIZE. When the world spans more than one node, Petit
+    runs EP inside each node and HierPetitMoE (petit_hier.py, Iris RCCL GIN)
+    carries tokens between the paired ranks of two nodes."""
+    import os
+
+    value = os.environ.get("TOKENSPEED_PETIT_NODE_SIZE")
+    return int(value) if value else None
 
 
 _workspace_cache: dict[tuple[int, _Profile], _Workspace] = {}
@@ -3064,6 +3077,41 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         )
 
     petit_kernel = _import_petit_kernel()
+    node_size = _petit_node_size()
+    if node_size is not None and world_size > node_size:
+        from petit_hier import HierPetitMoE, RcclGinProvider
+
+        if profile.activation != "silu_clamped" or world_size != 2 * node_size:
+            raise RuntimeError(
+                "two-level Petit supports DeepSeek V4.1 over two nodes only"
+            )
+        rank = dist.get_rank()
+        groups = [
+            dist.new_group(
+                list(range(n * node_size, (n + 1) * node_size)), backend="gloo"
+            )
+            for n in range(world_size // node_size)
+        ]
+        import os
+
+        # TOKENSPEED_PETIT_TRANSPORT: "gin" (RCCL GIN via Iris, default) or "mori" (MORI-CCO GDA).
+        transport = os.environ.get("TOKENSPEED_PETIT_TRANSPORT", "gin")
+        hier = HierPetitMoE(
+            petit_kernel,
+            RcclGinProvider() if transport == "gin" else None,
+            groups[rank // node_size],
+            num_experts=profile.num_experts,
+            topk=profile.top_k,
+            model_dim=profile.model_dim,
+            inter_dim=profile.inter_dim,
+            max_tokens=_MAX_TOKENS_PER_RANK // 2,
+            backend=transport,
+        )
+        workspace = _Workspace(
+            config=hier.petit.config, heap=None, inputs=None, hier=hier
+        )
+        _workspace_cache[key] = workspace
+        return workspace
     config = petit_kernel.MegaMoeConfig(
         world_size=world_size,
         num_experts=profile.num_experts,
@@ -3265,6 +3313,45 @@ def gluon_petit_mxfp4_megamoe_apply(
     state = w._moe_backend_state
     profile = state.profile
     workspace = _get_workspace(x.device, profile)
+    if workspace.hier is not None:
+        # Every rank exchanges the global maximum row count, so the two ranks
+        # of a pair agree; a rank pads its own rows with skipped routes.
+        padded = (
+            num_tokens
+            if max_num_tokens_per_gpu is None
+            else max(num_tokens, max_num_tokens_per_gpu)
+        )
+        hier = workspace.hier
+        ids = topk_ids.to(torch.int32).contiguous()
+        weights = topk_weights.to(torch.float32).contiguous()
+        petit_weights = (
+            state.w13_weight,
+            state.w2_weight,
+            state.w13_scale,
+            state.w2_scale,
+        )
+        if padded <= hier.max_tokens:
+            return hier.forward(
+                x, ids, weights, petit_weights, num_tokens=padded, overlap_fn=overlap_fn
+            )
+        # Petit sees [own | peer] rows, so it holds half its 1024-row capacity
+        # per call. Larger (prefill) batches run as several calls; the chunk
+        # count follows the global maximum, so both ranks of a pair agree.
+        outs = []
+        for start in range(0, padded, hier.max_tokens):
+            stop = min(start + hier.max_tokens, num_tokens)
+            rows = slice(start, max(start, stop))
+            outs.append(
+                hier.forward(
+                    x[rows],
+                    ids[rows],
+                    weights[rows],
+                    petit_weights,
+                    num_tokens=min(hier.max_tokens, padded - start),
+                    overlap_fn=overlap_fn if start == 0 else None,
+                )
+            )
+        return torch.cat(outs)
     inputs = _slice_inputs(workspace.inputs, num_tokens)
     if num_tokens:
         workspace.config.quantize(x.contiguous(), out=inputs)

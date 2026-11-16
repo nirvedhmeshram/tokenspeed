@@ -120,7 +120,7 @@ def _MegaMoESolutions():
     )
     # The config selector does not key tiles on rank count: EP4 reuses EP8 tiles.
     for ranks in (4, 8):
-        for experts, topk in ((384, 6), (128, 3)):
+        for experts, topk in ((384, 6), (192, 6), (128, 3)):
             register(
                 kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
                 ranks,

@@ -1,0 +1,19 @@
+# TokenSpeed on ROCm 10.1 (HIP >= 7.12, so RCCL's GIN device API is available).
+# Mirrors docker/Dockerfile.amd but keeps the base image's torch 2.14.0+rocm10.1.
+FROM rocm/pytorch:rocm10.1.0_ubuntu24.04_py3.12_pytorch_release_2.14.0
+ENV PIP_BREAK_SYSTEM_PACKAGES=1 DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openmpi-bin libopenmpi-dev libssl-dev libnuma1 pkg-config curl git \
+        libibverbs1 ibverbs-providers && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --ignore-installed --upgrade pip "setuptools<82" wheel cmake ninja
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+ENV PATH=/root/.cargo/bin:${PATH}
+COPY . /workspace
+WORKDIR /workspace
+RUN python3 -c "import torch; print(torch.__version__)" > /tmp/torch-before && \
+    python3 -m pip install --force-reinstall --no-deps ./tokenspeed-kernel-amd --no-build-isolation && \
+    TOKENSPEED_KERNEL_BACKEND=rocm python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
+    python3 -m pip install --force-reinstall --no-deps tokenspeed-scheduler/ && \
+    python3 -m pip install --force-reinstall --no-deps ./tokenspeed-engine && \
+    python3 -m pip install -e ./python --no-build-isolation && \
+    python3 -c "import torch; v=torch.__version__; b=open('/tmp/torch-before').read().strip(); assert v==b, (b, v); print('torch kept', v)"
