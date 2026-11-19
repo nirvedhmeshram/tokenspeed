@@ -3505,6 +3505,106 @@ def gluon_petit_mxfp4_megamoe_apply(
             "Gluon Petit MegaMoE received more than 1024 tokens on one rank"
         )
 
+    if _petit_noop():
+        # Prototype ablation (TOKENSPEED_PETIT_NOOP=1): skip the routed experts
+        # entirely to measure their share of a step. Output is wrong.
+        if overlap_fn is not None:
+            overlap_fn()
+        return x.new_zeros((num_tokens, w._moe_backend_state.profile.model_dim))
+    _petit_dump(topk_ids, topk_weights, num_tokens)
+    timer = _PetitTimer.get()
+    if timer is None or torch.cuda.is_current_stream_capturing():
+        return _gluon_petit_apply_body(
+            x, w, topk_weights, topk_ids, max_num_tokens_per_gpu, overlap_fn, num_tokens
+        )
+    e0 = torch.cuda.Event(enable_timing=True)
+    e1 = torch.cuda.Event(enable_timing=True)
+    e0.record()
+    out = _gluon_petit_apply_body(
+        x, w, topk_weights, topk_ids, max_num_tokens_per_gpu, overlap_fn, num_tokens
+    )
+    e1.record()
+    timer.add(e0, e1, num_tokens, max_num_tokens_per_gpu)
+    return out
+
+
+_PETIT_DUMP: dict = {}
+
+
+def _petit_dump(topk_ids, topk_weights, num_tokens) -> None:
+    """Prototype (TOKENSPEED_PETIT_DUMP=<dir>): save the real routing of the
+    first TOKENSPEED_PETIT_DUMP_CALLS eager calls with at least
+    TOKENSPEED_PETIT_DUMP_MIN rows, one file per rank."""
+    import os
+
+    d = os.environ.get("TOKENSPEED_PETIT_DUMP")
+    if not d or torch.cuda.is_current_stream_capturing():
+        return
+    st = _PETIT_DUMP.setdefault("s", {"ids": [], "w": [], "done": False, "seen": 0})
+    if st["done"] or not (
+        int(os.environ.get("TOKENSPEED_PETIT_DUMP_MIN", "8"))
+        <= num_tokens
+        <= int(os.environ.get("TOKENSPEED_PETIT_DUMP_MAX", "64"))
+    ):
+        return
+    # Skip startup warm-up and the first steps of the load (dummy / ramping batches).
+    st["seen"] += 1
+    if st["seen"] <= int(os.environ.get("TOKENSPEED_PETIT_DUMP_SKIP", "4000")):
+        return
+    st["ids"].append(topk_ids.to(torch.int32).cpu())
+    st["w"].append(topk_weights.to(torch.float32).cpu())
+    if len(st["ids"]) >= int(os.environ.get("TOKENSPEED_PETIT_DUMP_CALLS", "800")):
+        os.makedirs(d, exist_ok=True)
+        torch.save({"ids": st["ids"], "w": st["w"]}, f"{d}/routing-rank{dist.get_rank()}.pt")
+        st.update(ids=[], w=[], done=True)
+
+
+def _petit_noop() -> bool:
+    import os
+
+    return os.environ.get("TOKENSPEED_PETIT_NOOP") == "1"
+
+
+class _PetitTimer:
+    """Prototype instrumentation (TOKENSPEED_PETIT_TIMING=N): GPU time of every
+    eager Petit MoE call, logged as a mean every N calls. Not for production."""
+
+    _inst = None
+
+    def __init__(self, every):
+        self.every, self.pending, self.calls = every, [], 0
+
+    @classmethod
+    def get(cls):
+        if cls._inst is None:
+            import os
+
+            n = int(os.environ.get("TOKENSPEED_PETIT_TIMING", "0"))
+            cls._inst = cls(n) if n > 0 else False
+        return cls._inst or None
+
+    def add(self, e0, e1, n, nmax):
+        self.pending.append((e0, e1, n, nmax))
+        if len(self.pending) < self.every:
+            return
+        e1.synchronize()
+        times = sorted(a.elapsed_time(b) * 1000 for a, b, _, _ in self.pending)
+        ns = [p[2] for p in self.pending]
+        nm = [p[3] or p[2] for p in self.pending]
+        self.calls += len(self.pending)
+        import logging
+
+        logging.getLogger(__name__).warning(
+            f"PETIT_TIMING rank={dist.get_rank()} calls={self.calls} "
+            f"median_us={times[len(times)//2]:.1f} mean_us={sum(times)/len(times):.1f} "
+            f"tokens_mean={sum(ns)/len(ns):.1f} padded_mean={sum(nm)/len(nm):.1f}"
+        )
+        self.pending = []
+
+
+def _gluon_petit_apply_body(
+    x, w, topk_weights, topk_ids, max_num_tokens_per_gpu, overlap_fn, num_tokens
+):
     state = w._moe_backend_state
     profile = state.profile
     workspace = _get_workspace(x.device, profile)
