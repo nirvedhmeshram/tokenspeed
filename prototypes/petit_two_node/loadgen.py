@@ -28,6 +28,7 @@ Usage: python3 loadgen.py URL CONCURRENCY INPUT_LEN OUTPUT_LEN DURATION_S
 
 import asyncio
 import json
+import os
 import random
 import statistics
 import sys
@@ -45,15 +46,31 @@ URL, CONC, IN_LEN, OUT_LEN, DUR = (
 WORDS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau".split()
 
 
+PROMPTS = None
+if os.environ.get("PROMPTS_FILE"):
+    # Real, diverse prompts (e.g. ShareGPT first turns), truncated to ~IN_LEN words.
+    # A synthetic small-vocabulary prompt makes every request route to the same few
+    # experts, which understates MoE cost.
+    PROMPTS = json.load(open(os.environ["PROMPTS_FILE"]))
+
+
 def prompt(seed):
     rng = random.Random(seed)
+    if PROMPTS:
+        # Long inputs: concatenate random prompts until ~IN_LEN words (WORDS_PER_TOKEN scales it).
+        want = int(IN_LEN * float(os.environ.get("WORDS_PER_TOKEN", "1.0")))
+        words = []
+        while len(words) < want:
+            words += rng.choice(PROMPTS).split()
+        start = rng.randrange(max(1, len(words) - want))
+        return f"{seed} " + " ".join(words[start : start + want])
     # ~1 token per word for these words; a unique prefix defeats prefix caching.
     return f"{seed} " + " ".join(rng.choice(WORDS) for _ in range(IN_LEN))
 
 
 async def one(session, seed, stats):
     body = {
-        "model": "dsv41",
+        "model": os.environ.get("MODEL_NAME", "dsv41"),
         "prompt": prompt(seed),
         "max_tokens": OUT_LEN,
         "min_tokens": OUT_LEN,
@@ -94,9 +111,10 @@ async def worker(session, wid, stop, stats):
 async def main():
     stats = []
     conn = aiohttp.TCPConnector(limit=0)
-    async with aiohttp.ClientSession(
-        connector=conn, timeout=aiohttp.ClientTimeout(total=None)
-    ) as s:
+    # sock_read bounds the gap between streamed chunks: a hung server fails the
+    # run in a minute instead of blocking the sweep indefinitely.
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=60)
+    async with aiohttp.ClientSession(connector=conn, timeout=timeout) as s:
         await one(s, 999999, [])  # warm
         t_start = time.perf_counter()
         stop = t_start + DUR

@@ -2817,18 +2817,26 @@ class ServerArgs:
                     "Gluon Petit MegaMoE requires --dtype bfloat16; "
                     f"configured dtype={self.dtype}"
                 )
-            if self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1:
+            # Prototype (TOKENSPEED_PETIT_NODE_SIZE): attention TP inside a node
+            # with DP across nodes; each TP rank routes a slice of the tokens.
+            petit_sliced = bool(os.environ.get("TOKENSPEED_PETIT_NODE_SIZE"))
+            if not petit_sliced and (
+                self.mapping.attn.tp_size != 1 or self.mapping.dense.tp_size != 1
+            ):
                 raise ValueError(
                     "Gluon Petit MegaMoE requires attention TP1 and dense TP1"
                 )
+            petit_slices = self.mapping.attn.tp_size if petit_sliced else 1
             decode_tokens_per_request = (
                 self.speculative_num_draft_tokens
                 if self.speculative_algorithm is not None
                 else 1
             )
-            decode_tokens_per_rank = (
-                self.max_num_seqs // self.mapping.attn.dp_size
-            ) * decode_tokens_per_request
+            decode_tokens_per_rank = -(
+                -(self.max_num_seqs // self.mapping.attn.dp_size)
+                * decode_tokens_per_request
+                // petit_slices
+            )
             if decode_tokens_per_rank > 1024:
                 raise ValueError(
                     "Gluon Petit MegaMoE supports at most 1024 decode tokens "
@@ -2838,8 +2846,8 @@ class ServerArgs:
                 )
             if (
                 self.chunked_prefill_size <= 0
-                or self.chunked_prefill_size > 1024
-                or self.max_prefill_tokens > 1024
+                or self.chunked_prefill_size > 1024 * petit_slices
+                or self.max_prefill_tokens > 1024 * petit_slices
             ):
                 raise ValueError(
                     "Gluon Petit MegaMoE supports at most 1024 prefill tokens "

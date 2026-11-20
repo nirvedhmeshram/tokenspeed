@@ -3005,6 +3005,9 @@ _KIMI_K3_PROFILE = _Profile(
     inter_dim=3072,
     has_bias=False,
     activation="situ",
+    # EP16 only as the prototype's two-level layout (TOKENSPEED_PETIT_NODE_SIZE=8):
+    # Petit EP8 over each node's 448 experts.
+    world_sizes=frozenset({8, 16}),
 )
 _DSV41_FLASH_PROFILE = _Profile(
     name="dsv41_flash",
@@ -3190,7 +3193,11 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
             raise ValueError("Gluon Petit Kimi K3 requires SiTU beta=4, linear_beta=25")
         if w.w13_input_layout != "concatenated":
             raise ValueError("Gluon Petit Kimi K3 requires concatenated W13 input")
-        if w.w13_weight_bias is not None or w.w2_weight_bias is not None:
+        # The Kimi-K3 MoELayer declares no expert-bias parameters at all.
+        if (
+            getattr(w, "w13_weight_bias", None) is not None
+            or getattr(w, "w2_weight_bias", None) is not None
+        ):
             raise ValueError("Gluon Petit Kimi K3 requires bias-free experts")
         return profile
 
@@ -3272,9 +3279,12 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
     if node_size is not None and world_size > node_size:
         from petit_hier import HierPetitMoE, RcclGinProvider
 
-        if profile.activation != "silu_clamped" or world_size != 2 * node_size:
+        if (
+            profile.activation not in ("silu_clamped", "situ")
+            or world_size != 2 * node_size
+        ):
             raise RuntimeError(
-                "two-level Petit supports DeepSeek V4.1 over two nodes only"
+                "two-level Petit supports DeepSeek V4.1 and Kimi K3 over two nodes only"
             )
         rank = dist.get_rank()
         groups = [
@@ -3297,6 +3307,11 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
             inter_dim=profile.inter_dim,
             max_tokens=_MAX_TOKENS_PER_RANK // 2,
             backend=transport,
+            activation_function=(
+                petit_kernel.MegaMoeActivationFunction.kimi_situ
+                if profile.name == _KIMI_K3_PROFILE.name
+                else petit_kernel.MegaMoeActivationFunction(profile.activation)
+            ),
         )
         workspace = _Workspace(
             config=hier.petit.config, heap=None, inputs=None, hier=hier
@@ -3510,18 +3525,34 @@ def gluon_petit_mxfp4_megamoe_apply(
         # entirely to measure their share of a step. Output is wrong.
         if overlap_fn is not None:
             overlap_fn()
+        if not do_finalize:
+            raise NotImplementedError("TOKENSPEED_PETIT_NOOP needs do_finalize=True")
         return x.new_zeros((num_tokens, w._moe_backend_state.profile.model_dim))
     _petit_dump(topk_ids, topk_weights, num_tokens)
     timer = _PetitTimer.get()
     if timer is None or torch.cuda.is_current_stream_capturing():
         return _gluon_petit_apply_body(
-            x, w, topk_weights, topk_ids, max_num_tokens_per_gpu, overlap_fn, num_tokens
+            x,
+            w,
+            topk_weights,
+            topk_ids,
+            max_num_tokens_per_gpu,
+            overlap_fn,
+            num_tokens,
+            do_finalize,
         )
     e0 = torch.cuda.Event(enable_timing=True)
     e1 = torch.cuda.Event(enable_timing=True)
     e0.record()
     out = _gluon_petit_apply_body(
-        x, w, topk_weights, topk_ids, max_num_tokens_per_gpu, overlap_fn, num_tokens
+        x,
+        w,
+        topk_weights,
+        topk_ids,
+        max_num_tokens_per_gpu,
+        overlap_fn,
+        num_tokens,
+        do_finalize,
     )
     e1.record()
     timer.add(e0, e1, num_tokens, max_num_tokens_per_gpu)
@@ -3555,7 +3586,9 @@ def _petit_dump(topk_ids, topk_weights, num_tokens) -> None:
     st["w"].append(topk_weights.to(torch.float32).cpu())
     if len(st["ids"]) >= int(os.environ.get("TOKENSPEED_PETIT_DUMP_CALLS", "800")):
         os.makedirs(d, exist_ok=True)
-        torch.save({"ids": st["ids"], "w": st["w"]}, f"{d}/routing-rank{dist.get_rank()}.pt")
+        torch.save(
+            {"ids": st["ids"], "w": st["w"]}, f"{d}/routing-rank{dist.get_rank()}.pt"
+        )
         st.update(ids=[], w=[], done=True)
 
 
@@ -3603,12 +3636,23 @@ class _PetitTimer:
 
 
 def _gluon_petit_apply_body(
-    x, w, topk_weights, topk_ids, max_num_tokens_per_gpu, overlap_fn, num_tokens
+    x,
+    w,
+    topk_weights,
+    topk_ids,
+    max_num_tokens_per_gpu,
+    overlap_fn,
+    num_tokens,
+    do_finalize,
 ):
     state = w._moe_backend_state
     profile = state.profile
     workspace = _get_workspace(x.device, profile)
     if workspace.hier is not None:
+        if not do_finalize:
+            raise NotImplementedError(
+                "two-level Petit returns combined outputs only (do_finalize=True)"
+            )
         # Every rank exchanges the global maximum row count, so the two ranks
         # of a pair agree; a rank pads its own rows with skipped routes.
         padded = (

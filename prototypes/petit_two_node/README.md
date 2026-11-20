@@ -88,6 +88,28 @@ four GPUs each:
 --engram-host-table --chunked-prefill-size 1024 --max-prefill-tokens 1024
 ```
 
+### Kimi-K3 / K3.1: attention TP inside a node, DP across nodes
+
+For Kimi-K3 and K3.1, Petit runs over each node's 448 experts (a registered
+geometry next to the full 896), and the attention layout can instead be TP8
+inside each node with one DP replica per node:
+
+```
+--attn-tp-size 8 --data-parallel-size 2 --expert-parallel-size 16
+--world-size 16 --nprocs-per-node 8 --nnodes 2 --node-rank <0|1> --dist-init-addr <node0>:<port>
+--moe-backend gluon_petit --all2all-backend gluon_petit --dtype bfloat16
+--chunked-prefill-size 8192 --max-prefill-tokens 8192
+```
+
+The MoE then uses the token-sliced composition of `models/kimi_k3_deepep.py`:
+each TP rank routes a disjoint slice of its replica's tokens through the
+two-level Petit path, and the slices are all-gathered across the node before
+the up projection and shared experts. Every rank pads to the largest slice over
+all replicas, so the paired ranks of two nodes exchange the same row count.
+
+Ablations (timing only, outputs are wrong): `PETIT_SKIP_EXCHANGE=1` drops the
+cross-node traffic; `TOKENSPEED_PETIT_NOOP=1` skips the routed experts.
+
 ## Files
 
 | File | Purpose |
@@ -95,6 +117,7 @@ four GPUs each:
 | `petit_hier.py` | `HierPetitMoE`, transport kernels (GIN and MORI), node-local Petit heap |
 | `bench_hier.py` | Kernel-level check and timing of single-node Petit against the two-node version. Uses Petit's sparse exact-oracle weights; supports CUDA-graph timing |
 | `gin_pingpong.py`, `mori_pingpong.py` | Raw put latency / bandwidth between paired ranks |
+| `test_k3_half_petit.py` | Petit distributed reference test at the 448-expert Kimi geometry (`torchrun --nproc-per-node 8 test_k3_half_petit.py <tokenspeed-kernel/test/amd/gfx950/ops/moe>`) |
 | `loadgen.py` | Closed-loop OpenAI-completions load generator (TTFT, TPOT, tokens/s) |
 | `Dockerfile.rocm101` | TokenSpeed on the ROCm 10.1 PyTorch image (RCCL's GIN device API needs HIP >= 7.12) |
 

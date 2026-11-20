@@ -3858,7 +3858,12 @@ def create_kimi_linear_moe(
     checkpoint parameter names and the common model-forward interface.
     """
     implementation = KimiLinearMoE
-    if get_all2all_backend().is_deepep():
+    # Prototype: attention TP>1 with DP across nodes and Petit EP over all ranks
+    # uses the same token-sliced composition as DeepEP (each TP rank routes one
+    # slice of its replica's tokens; see kimi_k3_deepep.py).
+    if get_all2all_backend().is_deepep() or (
+        get_all2all_backend().is_gluon_petit() and mapping.attn.tp_size > 1
+    ):
         from tokenspeed.runtime.models.kimi_k3_deepep import KimiLinearMoEDeepEP
 
         implementation = KimiLinearMoEDeepEP

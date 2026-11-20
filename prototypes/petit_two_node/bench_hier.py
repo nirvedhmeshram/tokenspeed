@@ -136,8 +136,31 @@ def reference(x, ids, weights):
 # ── inputs ────────────────────────────────────────────────────────────────────
 
 
+_BANK = {}
+
+
+def replay_bank(T, rank, device):
+    """Real routing captured from a serving run (TOKENSPEED_PETIT_DUMP): every
+    dumped call with at least T rows, truncated to T rows, as [N, T, K]."""
+    key = (T, rank)
+    if key not in _BANK:
+        node_size = int(os.environ.get("REPLAY_RANKS", "4"))
+        d = torch.load(f"{os.environ['REPLAY_DIR']}/routing-rank{rank % node_size}.pt")
+        sel = [(i, w) for i, w in zip(d["ids"], d["w"]) if i.shape[0] >= T]
+        ids = torch.stack([i[:T] for i, _ in sel]).to(device)
+        ws = torch.stack([w[:T] for _, w in sel]).to(device)
+        _BANK[key] = (ids.contiguous(), ws.contiguous())
+    return _BANK[key]
+
+
 def make_inputs(T, rank, step, device, routing):
     g = torch.Generator(device=device).manual_seed(1000 * rank + 7 * T + step)
+    if routing == "replay":
+        bank_ids, bank_w = replay_bank(T, rank, device)
+        values = torch.randint(-63, 64, (T, H), generator=g, device=device)
+        x = (values.float() * 4.0).to(torch.bfloat16)
+        n = bank_ids.shape[0]
+        return x.contiguous(), bank_ids[step % n].clone(), bank_w[step % n].clone()
     if routing == "random":
         ids = (
             torch.rand((T, E), generator=g, device=device)
@@ -285,9 +308,27 @@ def main():
                     print(f"rank {rank} T={T} step={step}: {bad_rows.numel()} bad rows, first {bad_rows[:8].tolist()}; "
                           f"hier/ref norm ratio {(yh.float().norm() / ref.float().norm()).item():.3f}", flush=True)  # fmt: skip
 
-        tb = max_over_ranks(time_it(lambda: run_base(x, ids, w), iters, warmup))
+        if routing == "replay":
+            # Rotate through the captured calls; the two small copies are paid by both sides.
+            bank_ids, bank_w = replay_bank(T, rank, device)
+            ctr = [0]
+
+            def rotate():
+                i = ctr[0] % bank_ids.shape[0]
+                ctr[0] += 1
+                ids.copy_(bank_ids[i])
+                w.copy_(bank_w[i])
+
+        else:
+
+            def rotate():
+                pass
+
+        tb = max_over_ranks(
+            time_it(lambda: (rotate(), run_base(x, ids, w)), iters, warmup)
+        )
         th = max_over_ranks(
-            time_it(lambda: hier.forward(x, ids, w, hier_w), iters, warmup)
+            time_it(lambda: (rotate(), hier.forward(x, ids, w, hier_w)), iters, warmup)
         )
         graph_note = ""
         if os.environ.get("GRAPH", "1") == "1":
@@ -304,8 +345,12 @@ def main():
                 yh_static = hier.forward(x, ids, w, hier_w)
             torch.cuda.synchronize()
             dist.barrier()
-            gtb = max_over_ranks(time_it(gb.replay, iters, warmup))
-            gth = max_over_ranks(time_it(gh.replay, iters, warmup))
+            gtb = max_over_ranks(
+                time_it(lambda: (rotate(), gb.replay()), iters, warmup)
+            )
+            gth = max_over_ranks(
+                time_it(lambda: (rotate(), gh.replay()), iters, warmup)
+            )
             if check:
                 yb = run_base(x, ids, w)
                 torch.cuda.synchronize()

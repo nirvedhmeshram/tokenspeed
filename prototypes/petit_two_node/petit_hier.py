@@ -92,7 +92,15 @@ class PetitNode:
     """Petit MegaMoE over one node-local group: config, heap and input views."""
 
     def __init__(
-        self, petit_kernel, group, num_experts, topk, model_dim, inter_dim, max_tokens
+        self,
+        petit_kernel,
+        group,
+        num_experts,
+        topk,
+        model_dim,
+        inter_dim,
+        max_tokens,
+        activation_function=None,
     ):
         self.pk = petit_kernel
         self.world = dist.get_world_size(group)
@@ -102,7 +110,8 @@ class PetitNode:
             topk=topk,
             model_dim=model_dim,
             activation=petit_kernel.MegaMoeActivation.mxfp4,
-            activation_function=petit_kernel.MegaMoeActivationFunction.silu_clamped,
+            activation_function=activation_function
+            or petit_kernel.MegaMoeActivationFunction.silu_clamped,
             stages=petit_kernel.MegaMoeStages.two_stage,
             inter_dim=inter_dim,
             has_bias=False,
@@ -281,7 +290,7 @@ class HierPetitMoE:
     world ranks must be node-major (rank = node * local_world + local).
     """
 
-    def __init__(self, petit_kernel, provider: RcclGinProvider | None, node_group, *, num_experts, topk,model_dim, inter_dim, max_tokens, num_nodes=2, backend="gin"):  # fmt: skip
+    def __init__(self, petit_kernel, provider: RcclGinProvider | None, node_group, *, num_experts, topk,model_dim, inter_dim, max_tokens, num_nodes=2, backend="gin", activation_function=None):  # fmt: skip
         if num_nodes != 2:
             raise NotImplementedError("pairs ranks across exactly two nodes")
         self.rank = dist.get_rank()
@@ -299,6 +308,7 @@ class HierPetitMoE:
             model_dim,
             inter_dim,
             2 * max_tokens,
+            activation_function,
         )
         self.row_bytes = self.petit.views.tokens.stride(0)
         cap = max_tokens
@@ -321,6 +331,9 @@ class HierPetitMoE:
         self.o_crecv = region(cap * model_dim * 2)
         self.backend = backend
         self.provider = provider
+        self.return_puts = max(1, min(3, int(os.environ.get("PETIT_RETURN_PUTS", "1"))))
+        # PETIT_SKIP_EXCHANGE=1: timing ablation with no cross-node traffic (wrong output).
+        self.skip_exchange = os.environ.get("PETIT_SKIP_EXCHANGE") == "1"
         self._epoch = 0  # host-side count, for logging only
         if backend == "mori":
             t = self._init_mori(off)
@@ -503,6 +516,30 @@ class HierPetitMoE:
         rec()
         self._mark("routed")
         # dispatch: my rows/ids/weights -> the peer's [T, 2T) rows
+        if self.skip_exchange:
+            # Ablation (wrong results, for timing only): no cross-node traffic.
+            # Fill the peer half locally with this rank's own rows and peer-node
+            # ids, so Petit still sees 2T rows with a realistic routing mix.
+            self._in_tokens[T : 2 * T].copy_(self._in_tokens[:T])
+            self._in_scales[T : 2 * T].copy_(self._in_scales[:T])
+            self._ids[T : 2 * T].copy_(self._send_ids[:T])
+            self._w[T : 2 * T].copy_(self._w[:T])
+        else:
+            self._exchange_dispatch(T, rb, K)
+        rec()
+        both = self.pk_views(0, 2 * T)
+        self.petit.clear_route_outputs(2 * T)
+        self.petit.run(weights, 2 * T, out=self._out[: 2 * T], inputs=both)
+        self._mark("petit")
+        rec()
+        if not self.skip_exchange:
+            self._exchange_combine(T)
+        rec()
+        y = self._out[:n] + self._crecv[:n]
+        rec()
+        return y
+
+    def _exchange_dispatch(self, T, rb, K):
         self._send(
             [
                 (self.o_in, self.o_in + T * rb, T * rb),
@@ -515,17 +552,13 @@ class HierPetitMoE:
         self._mark("sent")
         self._wait(self.o_flags, 0, puts=3)
         self._mark("dispatched")
-        rec()
-        both = self.pk_views(0, 2 * T)
-        self.petit.clear_route_outputs(2 * T)
-        self.petit.run(weights, 2 * T, out=self._out[: 2 * T], inputs=both)
-        self._mark("petit")
-        rec()
-        # combine: the peer's rows of my output go home
-        # Split the return into up to three puts (MORI: three QP contexts) so a
-        # large combine is not limited to one queue pair's bandwidth.
+
+    def _exchange_combine(self, T):
+        # PETIT_RETURN_PUTS (1-3, default 1) splits the return into several puts
+        # (MORI: one QP context each) so a large combine is not limited to one
+        # queue pair's bandwidth.
         row = self.model_dim * 2
-        parts = min(3, T)
+        parts = min(self.return_puts, T)
         bounds = [T * i // parts for i in range(parts + 1)]
         segments = [
             (self.o_out + (T + a) * row, self.o_crecv + a * row, (b - a) * row)
@@ -533,10 +566,6 @@ class HierPetitMoE:
         ]
         self._send(segments, self.o_flags + 64, 1)
         self._wait(self.o_flags + 64, 1, puts=len(segments))
-        rec()
-        y = self._out[:n] + self._crecv[:n]
-        rec()
-        return y
 
     def _mark(self, msg):
         if os.environ.get("DIAG") == "2":

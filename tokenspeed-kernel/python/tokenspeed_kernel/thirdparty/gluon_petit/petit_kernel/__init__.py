@@ -299,7 +299,7 @@ class MegaMoeConfig:
         )
         kimi_config = (
             self.world_size == 8
-            and self.num_experts == 896
+            and self.num_experts in (896, 448)
             and self.topk == 16
             and self.model_dim == 3584
             and self.inter_dim == 3072

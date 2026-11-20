@@ -89,9 +89,17 @@ def _MegaMoESolutions():
             entries.append((solution.Repr(), MegaMoESolutionAdapter(solution)))
 
     P = MegaMoEProducerGeometry
-    register(
-        kMegaMoETwoStageMxFp4KimiSituSolutionId, 8, 896, 16, 3584, 3072, (P.kCta56,)
-    )
+    # 448 experts: one node's half of Kimi K3 in the prototype's two-level EP16.
+    for experts in (896, 448):
+        register(
+            kMegaMoETwoStageMxFp4KimiSituSolutionId,
+            8,
+            experts,
+            16,
+            3584,
+            3072,
+            (P.kCta56,),
+        )
     for ranks in (2, 4, 8):
         register(kMegaMoETwoStageMxFp4SolutionId, ranks, 32, 4, 2880, 3072, (P.kCta56,))
     register(

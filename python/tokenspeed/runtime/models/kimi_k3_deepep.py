@@ -39,6 +39,7 @@ from tokenspeed.runtime.layers.moe.latent import (
 from tokenspeed.runtime.layers.moe.topk import TopK, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
+    get_all2all_backend,
     get_moe_backend,
     use_deepep_low_latency,
 )
@@ -73,8 +74,11 @@ class KimiLinearMoEDeepEP(nn.Module):
         super().__init__()
         del model_scope, moe_block_count
         plan = Kimi3MoEExecutionPlan.build(mapping, get_moe_backend(), alt_stream)
+        # Prototype: Gluon Petit (two-level across nodes) also owns the routed
+        # dispatch/combine of the token slices.
+        self._petit = get_all2all_backend().is_gluon_petit()
         if (
-            not plan.use_marlin
+            not (plan.use_marlin or self._petit)
             or mapping.moe.tp_size != 1
             or mapping.moe.dp_size != 1
             or mapping.moe.ep_size != mapping.attn.tp_size * mapping.attn.dp_size
@@ -116,7 +120,7 @@ class KimiLinearMoEDeepEP(nn.Module):
                 "activation_situ_linear_beta": situ_linear_beta,
             },
             routing_mode="precomputed_topk",
-            internal_activation_dtype_override="input",
+            internal_activation_dtype_override=None if self._petit else "input",
         )
 
         self.topk = TopK(
@@ -191,7 +195,17 @@ class KimiLinearMoEDeepEP(nn.Module):
         ctx: ForwardContext | None,
         *,
         prefix_is_sharded: bool,
+        next_mix=None,
+        attention_gather=None,
+        attention_mix=None,
     ) -> torch.Tensor:
+        # attention_mix is optional work: leaving attention_mix.out unset makes
+        # the next layer compute its input mix itself.
+        del attention_mix
+        # The AMD fused attention-residual path passes these; they are only set
+        # with a row-sharded residual, which K3 turns off under attention DP.
+        if next_mix is not None or attention_gather is not None:
+            raise ValueError("token-sliced K3 MoE requires a replicated residual")
         if prefix_is_sharded:
             raise ValueError("DeepEP requires a replicated residual")
         if ctx is None:
@@ -234,6 +248,11 @@ class KimiLinearMoEDeepEP(nn.Module):
             shared = self.shared_experts(hidden_states, down_out=None)
 
         # Empty DP ranks still join dispatch/combine, including graph padding.
+        if self._petit and max_num_tokens_per_gpu is None:
+            # Petit pads every rank to this (the largest TP slice over all
+            # replicas, see CommManager.scattered_num_tokens); the paired ranks
+            # of two replicas must agree on it.
+            raise RuntimeError("Petit token slices need max_num_tokens_per_gpu")
         routed = self.experts(
             hidden_states=routed_in,
             topk_output=routing,
