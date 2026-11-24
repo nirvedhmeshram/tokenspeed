@@ -110,6 +110,40 @@ all replicas, so the paired ranks of two nodes exchange the same row count.
 Ablations (timing only, outputs are wrong): `PETIT_SKIP_EXCHANGE=1` drops the
 cross-node traffic; `TOKENSPEED_PETIT_NOOP=1` skips the routed experts.
 
+`TOKENSPEED_K3_TWO_NODE=1` swaps Petit for the native gfx950 SiTU EP kernels in
+the same TP8 x DP2 layout (`models/kimi_k3_two_node.py`): every rank of a node
+routes the node's tokens, swaps a 1/TP slice of routed inputs with its pair over
+`PairExchange` (RCCL GIN), all-gathers the received slices across the node and
+runs its 56 local experts over both nodes' tokens; partial outputs for the pair
+node's tokens are reduce-scattered and swapped back.
+
+### Prefill/decode disaggregation on AMD
+
+TokenSpeed's PD transfer loads `libtokenspeed_transfer_engine.so`, Mooncake's
+transfer engine with TokenSpeed's C entry points, which TokenSpeed builds for
+CUDA only. A ROCm build from upstream Mooncake at TokenSpeed's pinned commit
+plus its patches needs, beyond `-DUSE_HIP=ON`:
+
+- `-DENABLE_MULTI_PROTOCOL=ON`. The HIP build always installs Mooncake's HIP
+  (GPU IPC) transport next to RDMA and registers the KV pool under both. Only
+  the multi-protocol router skips HIP buffers for a peer on another host;
+  without it a cross-node transfer is routed to GPU IPC and fails
+  (`hipIpcOpenMemHandle: invalid device pointer`). `MC_DISABLE_HIP=1` also
+  takes effect only in this build.
+- On a ROCm-from-wheels image (no `/opt/rocm`): `ROCM_PATH`/`HIP_PATH` from
+  `rocm-sdk path --root` and `-DCMAKE_PREFIX_PATH=$(rocm-sdk path --cmake)`.
+- `-DWITH_STORE=OFF -DWITH_STORE_RUST=OFF` when only the transfer engine is
+  needed.
+
+Point `TOKENSPEED_MOONCAKE_LIBRARY` at the result. Serving notes: decode needs
+`--language-model-only` for Kimi-K3.1 (the vision encoder's data-parallel mode
+is refused on decode); leave memory headroom for transfer setup
+(`--gpu-memory-utilization 0.85` worked); headless engines refuse
+`--engine-startup-timeout`. On the gateway (`smg launch --pd-disaggregation`),
+raise `--worker-startup-timeout-secs` above the model's load time (engines do
+not re-register with a restarted gateway) and `--worker-wedge-secs` above a
+cold first prefill, and add `--model-alias <name>=<model path>`.
+
 ## Files
 
 | File | Purpose |

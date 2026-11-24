@@ -2186,7 +2186,8 @@ if platform.is_amd:
             "supports_deferred_finalize": frozenset({False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ep_size": frozenset({8}),
+            # 16: the prototype's two-node K3 MoE (kimi_k3_two_node.py).
+            "ep_size": frozenset({8, 16}),
             "ispp": frozenset({3072}),
             "internal_activation_dtype": frozenset({"input", "fp8"}),
             "supports_bias": frozenset({False}),

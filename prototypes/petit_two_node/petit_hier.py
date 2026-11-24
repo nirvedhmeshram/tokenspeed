@@ -592,3 +592,102 @@ class HierPetitMoE:
 
 def env_int(name, default):
     return int(os.environ.get(name, default))
+
+
+class PairExchange:
+    """Fixed-size packed-row swap between rank (n, l) and its pair (1-n, l).
+
+    Two directions share one GIN window: ``dispatch`` (signal 0) and ``combine``
+    (signal 1). Each call sends ``rows`` packed rows of ``row_bytes`` from this
+    rank's send buffer into the pair's receive buffer and waits for the pair's
+    rows. Both ranks of a pair must call with the same ``rows``. Device-side
+    rounds keep it CUDA-graph capturable.
+    """
+
+    def __init__(
+        self, provider, node_group, *, max_rows, dispatch_row_bytes, combine_row_bytes
+    ):
+        self.rank = dist.get_rank()
+        self.local_world = dist.get_world_size(node_group)
+        node = self.rank // self.local_world
+        self.peer = (1 - node) * self.local_world + self.rank % self.local_world
+        self.max_rows = max_rows
+        self.skip = os.environ.get("PETIT_SKIP_EXCHANGE") == "1"
+        off = 0
+
+        def region(nbytes):
+            nonlocal off
+            start = off
+            off = _align(off + nbytes)
+            return start
+
+        self.o_flags = region(256)
+        self.o_dsend = region(max_rows * dispatch_row_bytes)
+        self.o_drecv = region(max_rows * dispatch_row_bytes)
+        self.o_csend = region(max_rows * combine_row_bytes)
+        self.o_crecv = region(max_rows * combine_row_bytes)
+        self.drb, self.crb = dispatch_row_bytes, combine_row_bytes
+        self.provider = provider
+        self.window = provider.allocate_window(off)
+        self.direct = bool(self.window.address_map.direct[self.peer])
+        if not self.direct and not provider.gin_available:
+            raise RuntimeError(
+                f"peer {self.peer} is not load/store reachable and RCCL has no GIN backend"
+            )
+        self.comm = provider.device_comm(signal_count=2)
+        base = (
+            provider.read_signals(self.comm, count=2).tolist()
+            if provider.gin_available
+            else [0, 0]
+        )
+        self.window.tensor.zero_()
+        self._lib = rccl_gin.extern_libs()
+        self._state = torch.tensor(
+            base, dtype=torch.int64, device=t_device(self.window)
+        )
+        provider.barrier()
+        t = self.window.tensor
+        self.dsend = t[self.o_dsend : self.o_dsend + max_rows * self.drb].view(
+            max_rows, self.drb
+        )
+        self.drecv = t[self.o_drecv : self.o_drecv + max_rows * self.drb].view(
+            max_rows, self.drb
+        )
+        self.csend = t[self.o_csend : self.o_csend + max_rows * self.crb].view(
+            max_rows, self.crb
+        )
+        self.crecv = t[self.o_crecv : self.o_crecv + max_rows * self.crb].view(
+            max_rows, self.crb
+        )
+
+    def _swap(self, src_off, dst_off, nbytes, flag_off, signal):
+        w = self.window
+        _send_kernel[(1, 16 if self.direct else 1)](
+            w.tensor, w.address_map.peer_bases, self.comm.ptr, w.handle, self.rank, self.peer,
+            src_off, dst_off, nbytes, 0, 0, 0, 0, 0, 0, signal,
+            DIRECT=self.direct, NSEG=1, CHUNKS=16 if self.direct else 1, BLOCK=1024,
+            num_warps=4, extern_libs=self._lib,
+        )  # fmt: skip
+        if self.direct:
+            _notify_kernel[(1,)](w.tensor, w.address_map.peer_bases, flag_off, self.rank, self.peer,
+                                 self._state[signal:], num_warps=1)  # fmt: skip
+        _wait_kernel[(1,)](w.tensor, self.comm.ptr, flag_off, signal, self._state[signal:], 1,
+                           DIRECT=self.direct, num_warps=1, extern_libs=self._lib)  # fmt: skip
+
+    def dispatch(self, rows):
+        """Send ``dsend[:rows]``; return the pair's rows in ``drecv[:rows]``."""
+        if self.skip:  # timing ablation: no cross-node traffic (wrong results)
+            self.drecv[:rows].copy_(self.dsend[:rows])
+        elif rows:
+            self._swap(self.o_dsend, self.o_drecv, rows * self.drb, self.o_flags, 0)
+        return self.drecv[:rows]
+
+    def combine(self, rows):
+        """Send ``csend[:rows]``; return the pair's rows in ``crecv[:rows]``."""
+        if self.skip:
+            self.crecv[:rows].copy_(self.csend[:rows])
+        elif rows:
+            self._swap(
+                self.o_csend, self.o_crecv, rows * self.crb, self.o_flags + 64, 1
+            )
+        return self.crecv[:rows]

@@ -3858,6 +3858,14 @@ def create_kimi_linear_moe(
     checkpoint parameter names and the common model-forward interface.
     """
     implementation = KimiLinearMoE
+    import os
+
+    # Prototype (TOKENSPEED_K3_TWO_NODE=1): attention TP8 per node, DP across
+    # two nodes, native gfx950 EP16 kernels with a GIN pair exchange.
+    if os.environ.get("TOKENSPEED_K3_TWO_NODE") == "1":
+        from tokenspeed.runtime.models.kimi_k3_two_node import KimiLinearMoETwoNode
+
+        implementation = KimiLinearMoETwoNode
     # Prototype: attention TP>1 with DP across nodes and Petit EP over all ranks
     # uses the same token-sliced composition as DeepEP (each TP rank routes one
     # slice of its replica's tokens; see kimi_k3_deepep.py).
